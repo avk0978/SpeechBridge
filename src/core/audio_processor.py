@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+"""
+AudioProcessor: Модуль обработки аудио файлов
+Сегментация аудио по паузам, подгонка длительности сегментов
+"""
+
+import logging
+from pathlib import Path
+from typing import List, Dict, Optional
+
+from pydub import AudioSegment
+from pydub.silence import split_on_silence
+
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).parent.parent))
+from config import config
+
+
+class AudioProcessor:
+    """Класс для обработки аудио файлов"""
+    
+    def __init__(self):
+        self.config = config
+        self.logger = logging.getLogger(__name__)
+    
+    def segment_audio(
+        self, 
+        audio_path: str, 
+        min_silence_len: Optional[int] = None,
+        silence_thresh: Optional[int] = None,
+        keep_silence: Optional[int] = None
+    ) -> List[Dict]:
+        """
+        Сегментация аудио по паузам
+        
+        Args:
+            audio_path: путь к аудио файлу
+            min_silence_len: минимальная длительность паузы (мс)
+            silence_thresh: порог тишины (дБ)
+            keep_silence: сколько тишины оставлять (мс)
+            
+        Returns:
+            list: список сегментов с метаданными
+        """
+        try:
+            self.logger.info(f"Сегментация аудио: {audio_path}")
+            
+            # Проверка существования файла
+            if not Path(audio_path).exists():
+                raise FileNotFoundError(f"Аудио файл не найден: {audio_path}")
+            
+            # Использование параметров из конфигурации если не указаны
+            min_silence_len = min_silence_len or self.config.MIN_SILENCE_LEN
+            silence_thresh = silence_thresh or self.config.SILENCE_THRESH
+            keep_silence = keep_silence or self.config.KEEP_SILENCE
+            
+            # Загрузка аудио
+            audio = AudioSegment.from_wav(audio_path)
+            original_duration = len(audio)
+            
+            self.logger.debug(f"Оригинальная длительность: {original_duration/1000:.2f}s")
+            self.logger.debug(f"Параметры сегментации: min_silence={min_silence_len}ms, "
+                            f"thresh={silence_thresh}dB, keep={keep_silence}ms")
+            
+            # Разделение по паузам
+            chunks = split_on_silence(
+                audio,
+                min_silence_len=min_silence_len,
+                silence_thresh=silence_thresh,
+                keep_silence=keep_silence
+            )
+            
+            segments = []
+            current_time = 0
+            
+            for i, chunk in enumerate(chunks):
+                chunk_duration = len(chunk)
+                
+                # Игнорируем очень короткие фрагменты
+                if chunk_duration < 100:  # меньше 0.1 секунды
+                    current_time += chunk_duration
+                    continue
+                
+                # Создание временного файла для сегмента
+                segment_path = self.config.get_temp_filename(f"segment_{i}", ".wav")
+                chunk.export(str(segment_path), format="wav")
+                
+                segment_info = {
+                    'id': i,
+                    'path': str(segment_path),
+                    'start_time': current_time / 1000.0,
+                    'end_time': (current_time + chunk_duration) / 1000.0,
+                    'duration': chunk_duration / 1000.0,
+                    'size_bytes': Path(segment_path).stat().st_size,
+                    'sample_rate': chunk.frame_rate,
+                    'channels': chunk.channels
+                }
+                
+                segments.append(segment_info)
+                current_time += chunk_duration
+            
+            self.logger.info(f"Создано {len(segments)} сегментов из аудио длительностью {original_duration/1000:.2f}s")
+            return segments
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка сегментации аудио: {e}")
+            return []
+    
+    def adjust_audio_duration(
+        self, 
+        audio_path: str, 
+        target_duration: float,
+        method: str = 'auto'
+    ) -> Optional[str]:
+        """
+        Подгонка длительности аудио под целевое значение
+        
+        Args:
+            audio_path: путь к аудио файлу
+            target_duration: целевая длительность в секундах
+            method: метод подгонки ('speed', 'pad', 'auto')
+            
+        Returns:
+            str: путь к подогнанному аудио файлу или None при ошибке
+        """
+        try:
+            if not Path(audio_path).exists():
+                raise FileNotFoundError(f"Аудио файл не найден: {audio_path}")
+            
+            # Загрузка аудио
+            audio = AudioSegment.from_file(audio_path)
+            current_duration = len(audio) / 1000.0
+            
+            # Если длительности почти равны, ничего не делаем
+            if abs(current_duration - target_duration) < 0.1:
+                self.logger.debug(f"Длительность уже подходящая: {current_duration:.2f}s")
+                return audio_path
+            
+            self.logger.debug(f"Подгонка длительности: {current_duration:.2f}s -> {target_duration:.2f}s")
+            
+            if method == 'auto':
+                # Автоматический выбор метода
+                ratio = current_duration / target_duration
+                if 0.8 <= ratio <= 1.3:
+                    method = 'speed'  # Изменение скорости в разумных пределах
+                else:
+                    method = 'pad'    # Обрезка или дополнение тишиной
+            
+            if method == 'speed' and current_duration > target_duration:
+                # Ускорение аудио
+                speed_factor = current_duration / target_duration
+                # Ограничиваем ускорение до разумных пределов
+                speed_factor = min(speed_factor, 1.5)
+                adjusted_audio = audio.speedup(playback_speed=speed_factor)
+                
+            elif method == 'speed' and current_duration < target_duration:
+                # Замедление аудио
+                speed_factor = current_duration / target_duration
+                # Ограничиваем замедление до разумных пределов
+                speed_factor = max(speed_factor, 0.7)
+                adjusted_audio = audio.speedup(playback_speed=speed_factor)
+                
+            elif current_duration > target_duration:
+                # Обрезка аудио
+                target_ms = int(target_duration * 1000)
+                adjusted_audio = audio[:target_ms]
+                
+            else:
+                # Добавление тишины в конец
+                silence_duration = int((target_duration - current_duration) * 1000)
+                silence = AudioSegment.silent(duration=silence_duration)
+                adjusted_audio = audio + silence
+            
+            # Сохранение подогнанного аудио
+            adjusted_path = self.config.get_temp_filename("adjusted", ".wav")
+            adjusted_audio.export(str(adjusted_path), format="wav")
+            
+            final_duration = len(adjusted_audio) / 1000.0
+            self.logger.debug(f"Финальная длительность: {final_duration:.2f}s")
+            
+            return str(adjusted_path)
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка подгонки длительности аудио: {e}")
+            return audio_path
+    
+    def normalize_audio_volume(self, audio_path: str, target_dBFS: float = -20.0) -> Optional[str]:
+        """
+        Нормализация громкости аудио
+        
+        Args:
+            audio_path: путь к аудио файлу
+            target_dBFS: целевая громкость в dBFS
+            
+        Returns:
+            str: путь к нормализованному аудио файлу
+        """
+        try:
+            if not Path(audio_path).exists():
+                raise FileNotFoundError(f"Аудио файл не найден: {audio_path}")
+            
+            audio = AudioSegment.from_file(audio_path)
+            current_dBFS = audio.dBFS
+            
+            # Вычисление необходимого изменения громкости
+            volume_change = target_dBFS - current_dBFS
+            
+            # Применение изменения громкости
+            normalized_audio = audio + volume_change
+            
+            # Сохранение нормализованного аудио
+            normalized_path = self.config.get_temp_filename("normalized", ".wav")
+            normalized_audio.export(str(normalized_path), format="wav")
+            
+            self.logger.debug(f"Нормализация громкости: {current_dBFS:.1f}dBFS -> {target_dBFS:.1f}dBFS")
+            return str(normalized_path)
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка нормализации громкости: {e}")
+            return audio_path
+    
+    def apply_audio_effects(
+        self, 
+        audio_path: str, 
+        effects: Dict[str, any] = None
+    ) -> Optional[str]:
+        """
+        Применение аудио эффектов
+        
+        Args:
+            audio_path: путь к аудио файлу
+            effects: словарь с эффектами и их параметрами
+            
+        Returns:
+            str: путь к обработанному аудио файлу
+        """
+        try:
+            if not Path(audio_path).exists():
+                raise FileNotFoundError(f"Аудио файл не найден: {audio_path}")
+            
+            if not effects:
+                return audio_path
+            
+            audio = AudioSegment.from_file(audio_path)
+            
+            # Применение эффектов
+            if effects.get('fade_in'):
+                fade_duration = int(effects['fade_in'] * 1000)  # в миллисекундах
+                audio = audio.fade_in(fade_duration)
+            
+            if effects.get('fade_out'):
+                fade_duration = int(effects['fade_out'] * 1000)
+                audio = audio.fade_out(fade_duration)
+            
+            if effects.get('volume_boost'):
+                audio = audio + effects['volume_boost']  # в dB
+            
+            if effects.get('low_pass_filter'):
+                # Простая реализация low-pass фильтра через изменение sample rate
+                pass  # Требует более сложной реализации с библиотеками DSP
+            
+            # Сохранение обработанного аудио
+            processed_path = self.config.get_temp_filename("processed", ".wav")
+            audio.export(str(processed_path), format="wav")
+            
+            self.logger.debug(f"Применены эффекты: {list(effects.keys())}")
+            return str(processed_path)
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка применения аудио эффектов: {e}")
+            return audio_path
+    
+    def get_audio_info(self, audio_path: str) -> Optional[Dict]:
+        """
+        Получение информации об аудио файле
+        
+        Args:
+            audio_path: путь к аудио файлу
+            
+        Returns:
+            dict: информация об аудио файле
+        """
+        try:
+            if not Path(audio_path).exists():
+                return None
+            
+            audio = AudioSegment.from_file(audio_path)
+            
+            info = {
+                'duration': len(audio) / 1000.0,  # в секундах
+                'duration_ms': len(audio),
+                'sample_rate': audio.frame_rate,
+                'channels': audio.channels,
+                'sample_width': audio.sample_width,
+                'frame_count': audio.frame_count(),
+                'dBFS': audio.dBFS,
+                'max_dBFS': audio.max_dBFS,
+                'file_size': Path(audio_path).stat().st_size,
+                'file_format': Path(audio_path).suffix[1:].upper()
+            }
+            
+            return info
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка получения информации об аудио: {e}")
+            return None
+    
+    def detect_silence_segments(
+        self, 
+        audio_path: str,
+        min_silence_len: int = 500,
+        silence_thresh: int = -40
+    ) -> List[Dict]:
+        """
+        Обнаружение сегментов тишины в аудио
+        
+        Args:
+            audio_path: путь к аудио файлу
+            min_silence_len: минимальная длительность тишины (мс)
+            silence_thresh: порог тишины (дБ)
+            
+        Returns:
+            list: список сегментов тишины
+        """
+        try:
+            if not Path(audio_path).exists():
+                raise FileNotFoundError(f"Аудио файл не найден: {audio_path}")
+            
+            from pydub.silence import detect_silence
+            
+            audio = AudioSegment.from_file(audio_path)
+            
+            # Обнаружение сегментов тишины
+            silence_segments = detect_silence(
+                audio, 
+                min_silence_len=min_silence_len, 
+                silence_thresh=silence_thresh
+            )
+            
+            # Преобразование в более удобный формат
+            silence_info = []
+            for start_ms, end_ms in silence_segments:
+                silence_info.append({
+                    'start_time': start_ms / 1000.0,
+                    'end_time': end_ms / 1000.0,
+                    'duration': (end_ms - start_ms) / 1000.0
+                })
+            
+            self.logger.debug(f"Найдено {len(silence_info)} сегментов тишины")
+            return silence_info
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка обнаружения тишины: {e}")
+            return []
+    
+    def cleanup_temp_segments(self, segments: List[Dict]):
+        """
+        Очистка временных файлов сегментов
+        
+        Args:
+            segments: список сегментов с путями к файлам
+        """
+        cleaned_count = 0
+        for segment in segments:
+            try:
+                segment_path = segment.get('path')
+                if segment_path and Path(segment_path).exists():
+                    Path(segment_path).unlink()
+                    cleaned_count += 1
+            except Exception as e:
+                self.logger.warning(f"Не удалось удалить сегмент {segment.get('path')}: {e}")
+        
+        self.logger.debug(f"Очищено {cleaned_count} временных аудио файлов")
+
+
+if __name__ == "__main__":
+    # Тестирование модуля
+    print("=== Тестирование AudioProcessor ===")
+    
+    processor = AudioProcessor()
+    print(f"AudioProcessor инициализирован")
+    
+    # Тест с фиктивным файлом
+    test_file = "test.wav"
+    if Path(test_file).exists():
+        info = processor.get_audio_info(test_file)
+        print(f"Информация об аудио: {info}")
+    else:
+        print(f"Тестовый файл {test_file} не найден")
