@@ -63,6 +63,20 @@ class AudioProcessor:
             self.logger.debug(f"Параметры сегментации: min_silence={min_silence_len}ms, "
                             f"thresh={silence_thresh}dB, keep={keep_silence}ms")
             
+            # Обнаруживаем начальную тишину перед первым речевым сегментом
+            self.logger.debug("🔍 Определяем начальную тишину...")
+            
+            # Находим первый не тихий сегмент
+            silence_segments = self._detect_silence_ranges(audio, min_silence_len, silence_thresh)
+            initial_silence_duration = 0
+            
+            if silence_segments:
+                # Если есть тишина в начале файла (начинается с 0)
+                first_silence = silence_segments[0]
+                if first_silence['start_time'] <= 0.05:  # Погрешность 50мс
+                    initial_silence_duration = first_silence['duration'] * 1000  # в миллисекундах
+                    self.logger.debug(f"📍 Найдена начальная тишина: {initial_silence_duration/1000:.2f}s")
+            
             # Разделение по паузам
             chunks = split_on_silence(
                 audio,
@@ -72,7 +86,8 @@ class AudioProcessor:
             )
             
             segments = []
-            current_time = 0
+            # Начинаем отсчет с учетом начальной тишины
+            current_time = initial_silence_duration
             
             for i, chunk in enumerate(chunks):
                 chunk_duration = len(chunk)
@@ -86,21 +101,33 @@ class AudioProcessor:
                 segment_path = self.config.get_temp_filename(f"segment_{i}", ".wav")
                 chunk.export(str(segment_path), format="wav")
                 
+                # Учитываем начальную тишину в таймингах
+                actual_start_time = current_time / 1000.0
+                actual_end_time = (current_time + chunk_duration) / 1000.0
+                
                 segment_info = {
                     'id': i,
                     'path': str(segment_path),
-                    'start_time': current_time / 1000.0,
-                    'end_time': (current_time + chunk_duration) / 1000.0,
+                    'start_time': actual_start_time,
+                    'end_time': actual_end_time,
                     'duration': chunk_duration / 1000.0,
                     'size_bytes': Path(segment_path).stat().st_size,
                     'sample_rate': chunk.frame_rate,
-                    'channels': chunk.channels
+                    'channels': chunk.channels,
+                    'has_initial_silence': initial_silence_duration > 0,
+                    'initial_silence_duration': initial_silence_duration / 1000.0
                 }
                 
                 segments.append(segment_info)
                 current_time += chunk_duration
             
             self.logger.info(f"Создано {len(segments)} сегментов из аудио длительностью {original_duration/1000:.2f}s")
+            
+            if initial_silence_duration > 0:
+                self.logger.info(f"✅ Учтена начальная тишина: {initial_silence_duration/1000:.2f}s")
+                if segments:
+                    self.logger.debug(f"📍 Первый речевой сегмент начинается с {segments[0]['start_time']:.2f}s (вместо 0.0s)")
+            
             return segments
             
         except Exception as e:
@@ -164,16 +191,40 @@ class AudioProcessor:
                     # Создаем исправленный файл с точной длительностью
                     adjusted_path = self.config.get_temp_filename("ffmpeg_adjusted", ".wav")
                     
-                    # Используем FFmpeg для изменения длительности и нормализации
+                    # Интеллектуальная обработка длительности без потери смысла
                     if target_duration > 0:
-                        cmd = [
-                            'ffmpeg', '-f', 'aiff', '-i', audio_path,  # принудительно указываем AIFF формат
-                            '-af', f'loudnorm,apad=pad_dur={target_duration},atrim=duration={target_duration}',  # используем loudnorm для нормализации
-                            '-acodec', 'pcm_s16le',
-                            '-ar', '44100', 
-                            '-ac', '1',
-                            '-y', str(adjusted_path)
-                        ]
+                        duration_diff = target_duration - current_duration
+                        
+                        if abs(duration_diff) < 0.1:
+                            # Различие меньше 100мс - используем без обрезки
+                            self.logger.debug(f"🔧 Различие длительности минимально ({duration_diff:.3f}s), сохраняем без изменений")
+                            cmd = [
+                                'ffmpeg', '-f', 'aiff', '-i', audio_path,
+                                '-af', 'loudnorm',  # только нормализация
+                                '-acodec', 'pcm_s16le', '-ar', '44100', '-ac', '1',
+                                '-y', str(adjusted_path)
+                            ]
+                        elif duration_diff > 0:
+                            # Аудио короче целевой длительности - добавляем тишину
+                            self.logger.debug(f"🔧 Добавляем {duration_diff:.2f}s тишины в конец")
+                            cmd = [
+                                'ffmpeg', '-f', 'aiff', '-i', audio_path,
+                                '-af', f'loudnorm,apad=pad_dur={target_duration}',
+                                '-acodec', 'pcm_s16le', '-ar', '44100', '-ac', '1',
+                                '-y', str(adjusted_path)
+                            ]
+                        else:
+                            # Аудио длиннее целевой длительности - предупреждение и сохранение смысла
+                            self.logger.warning(f"⚠️ Аудио на {abs(duration_diff):.2f}s длиннее целевой длительности!")
+                            self.logger.warning(f"💡 СОХРАНЯЕМ ВСЕ АУДИО для избежания потери смысла")
+                            
+                            # Сохраняем полное аудио с предупреждением
+                            cmd = [
+                                'ffmpeg', '-f', 'aiff', '-i', audio_path,
+                                '-af', 'loudnorm',  # только нормализация, БЕЗ обрезки
+                                '-acodec', 'pcm_s16le', '-ar', '44100', '-ac', '1',
+                                '-y', str(adjusted_path)
+                            ]
                     else:
                         # Если целевая длительность 0, просто нормализуем
                         cmd = [
@@ -442,6 +493,43 @@ class AudioProcessor:
             
         except Exception as e:
             self.logger.error(f"Ошибка обнаружения тишины: {e}")
+            return []
+    
+    def _detect_silence_ranges(self, audio_segment: AudioSegment, min_silence_len: int, silence_thresh: int) -> List[Dict]:
+        """
+        Вспомогательный метод для обнаружения сегментов тишины из AudioSegment
+        
+        Args:
+            audio_segment: объект AudioSegment
+            min_silence_len: минимальная длительность тишины (мс)
+            silence_thresh: порог тишины (дБ)
+            
+        Returns:
+            list: список сегментов тишины с информацией о времени и длительности
+        """
+        try:
+            from pydub.silence import detect_silence
+            
+            # Обнаружение сегментов тишины
+            silence_segments = detect_silence(
+                audio_segment, 
+                min_silence_len=min_silence_len, 
+                silence_thresh=silence_thresh
+            )
+            
+            # Преобразование в более удобный формат
+            silence_info = []
+            for start_ms, end_ms in silence_segments:
+                silence_info.append({
+                    'start_time': start_ms / 1000.0,
+                    'end_time': end_ms / 1000.0,
+                    'duration': (end_ms - start_ms) / 1000.0
+                })
+            
+            return silence_info
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка обнаружения диапазонов тишины: {e}")
             return []
     
     def cleanup_temp_segments(self, segments: List[Dict]):

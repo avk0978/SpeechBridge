@@ -169,16 +169,36 @@ class VideoProcessor:
                             )
                             silent_video.close()
 
-                            # Объединяем через FFmpeg
+                            # Получаем длительности для интеллектуального объединения
+                            video_duration = self._get_media_duration(temp_video_path)
+                            audio_duration = self._get_media_duration(final_audio_path)
+                            
+                            self.logger.info(f"📊 Длительности: видео={video_duration:.2f}s, аудио={audio_duration:.2f}s")
+                            
+                            # Интеллектуальное объединение без потери смысла
                             cmd = [
                                 'ffmpeg', '-y',
                                 '-i', temp_video_path,  # видео без звука
                                 '-i', final_audio_path,  # аудио дорожка
                                 '-c:v', 'copy',  # копируем видео
                                 '-c:a', 'aac',  # кодируем аудио в AAC
-                                '-shortest',  # обрезаем по короткому
-                                output_path
                             ]
+                            
+                            # Стратегия объединения зависит от соотношения длительностей
+                            if abs(video_duration - audio_duration) < 1.0:
+                                # Длительности почти равны - используем shortest (безопасно)
+                                cmd.append('-shortest')
+                                self.logger.debug("🔧 Используем -shortest (длительности близки)")
+                            elif audio_duration > video_duration:
+                                # Аудио длиннее - расширяем видео черным кадром
+                                cmd.extend(['-filter_complex', f'[0:v]pad=enable=\'between(t,{video_duration},{audio_duration})\':color=black'])
+                                self.logger.debug("🔧 Расширяем видео черным кадром для сохранения аудио")
+                            else:
+                                # Видео длиннее - сохраняем все аудио, видео без звука в конце
+                                cmd.append('-shortest')
+                                self.logger.debug("🔧 Сохраняем все аудио, видео завершится тишиной")
+                            
+                            cmd.append(output_path)
 
                             result = subprocess.run(cmd, capture_output=True, text=True)
 
@@ -315,6 +335,40 @@ class VideoProcessor:
                     self.logger.warning(f"Ошибка удаления временного файла: {cleanup_e}")
 
             return False
+    
+    def _get_media_duration(self, media_path: str) -> float:
+        """
+        Получение длительности медиа файла
+        
+        Args:
+            media_path: путь к медиа файлу
+            
+        Returns:
+            float: длительность в секундах
+        """
+        try:
+            import subprocess
+            
+            cmd = [
+                'ffprobe', 
+                '-v', 'quiet',
+                '-show_entries', 'format=duration',
+                '-of', 'csv=p=0',
+                media_path
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            
+            if result.returncode == 0:
+                duration = float(result.stdout.strip())
+                return duration
+            else:
+                self.logger.warning(f"Не удалось получить длительность {media_path}: {result.stderr}")
+                return 0.0
+                
+        except Exception as e:
+            self.logger.error(f"Ошибка получения длительности {media_path}: {e}")
+            return 0.0
 
     def _combine_translated_audio(self, segments: List[dict], video_duration: float,
                                   preserve_original: bool = False, original_audio=None) -> Optional[str]:
