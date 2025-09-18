@@ -19,6 +19,7 @@ except Exception:
 
 import logging
 import time
+import subprocess
 from typing import Optional, Dict, List, Callable
 import json
 from datetime import datetime
@@ -26,6 +27,8 @@ from pathlib import Path
 
 # Core модули
 from core import VideoProcessor, AudioProcessor, SpeechRecognizer, SpeechSynthesizer
+from core.speaker_diarization import SpeakerDiarization
+from core.video_time_adjuster import VideoTimeAdjuster
 from translator_compat import translate_text, get_translator_status
 from config import config
 
@@ -41,6 +44,8 @@ class VideoTranslator:
         self.audio_processor = AudioProcessor()
         self.speech_recognizer = SpeechRecognizer()
         self.speech_synthesizer = SpeechSynthesizer()
+        self.speaker_diarization = SpeakerDiarization(config)
+        self.video_adjuster = VideoTimeAdjuster(config)
 
         # Создание рабочих директорий
         self.config.create_directories()
@@ -1009,10 +1014,22 @@ class VideoTranslator:
             if progress_callback:
                 progress_callback("Сегментация аудио по паузам", 20)
 
-            # ВРЕМЕННО: используем только старый надёжный метод сегментации
-            # TODO: вернуть Whisper timestamps когда исправим зависание
-            self.logger.info("🔄 Используем стабильную сегментацию по паузам")
-            segments = self.audio_processor.segment_audio(audio_path)
+            # Выбор метода сегментации в зависимости от настроек
+            use_speaker_segments = getattr(self.config, 'USE_SPEAKER_DIARIZATION', False)
+            
+            if use_speaker_segments:
+                self.logger.info("🎭 Используем сегментацию по спикерам")
+                segments = self.speaker_diarization.segment_by_speakers(audio_path)
+                
+                # Объединяем короткие сегменты одного спикера
+                segments = self.speaker_diarization.merge_short_segments(segments, min_duration=5.0)
+                
+                if not segments:
+                    self.logger.warning("⚠️ Сегментация по спикерам не удалась, используем обычную")
+                    segments = self.audio_processor.segment_audio(audio_path)
+            else:
+                self.logger.info("🔄 Используем стабильную сегментацию по паузам")
+                segments = self.audio_processor.segment_audio(audio_path)
             
             if not segments:
                 self.logger.error("Ошибка сегментации аудио")
@@ -1193,8 +1210,13 @@ class VideoTranslator:
             if progress_callback:
                 progress_callback("Создание финального видео", 85)
 
-            # 5. Создание финального видео
-            success = self.video_processor.create_final_video(video_path, translated_segments, output_path)
+            # 5. Создание финального видео с адаптивной синхронизацией
+            use_adaptive_timing = getattr(self.config, 'USE_ADAPTIVE_VIDEO_TIMING', True)
+            
+            if use_adaptive_timing:
+                success = self._create_adaptive_final_video(video_path, translated_segments, output_path)
+            else:
+                success = self.video_processor.create_final_video(video_path, translated_segments, output_path)
 
             if progress_callback:
                 progress_callback("Завершено" if success else "Ошибка создания видео", 100 if success else 0)
@@ -1259,6 +1281,95 @@ class VideoTranslator:
         
         self.logger.info(f"🕒 Создано {len(segments)} сегментов по временным меткам Whisper")
         return segments
+
+    def _create_adaptive_final_video(self, video_path: str, segments: List[Dict], output_path: str) -> bool:
+        """
+        Создает финальное видео с адаптивной синхронизацией времени
+        
+        Args:
+            video_path: путь к исходному видео
+            segments: переведенные сегменты
+            output_path: путь для сохранения результата
+            
+        Returns:
+            bool: успешность создания видео
+        """
+        try:
+            self.logger.info("🎬 Создание адаптивного финального видео")
+            
+            # Сначала создаем обычное видео
+            temp_video_path = output_path.replace('.mp4', '_temp.mp4')
+            success = self.video_processor.create_final_video(video_path, segments, temp_video_path)
+            
+            if not success:
+                self.logger.error("❌ Не удалось создать базовое видео")
+                return False
+            
+            # Получаем путь к финальному аудио
+            final_audio_path = self._find_combined_audio_path()
+            
+            if not final_audio_path:
+                self.logger.warning("⚠️ Не найден путь к финальному аудио, используем обычное видео")
+                Path(temp_video_path).rename(output_path)
+                return True
+            
+            # Проверяем необходимость адаптации времени
+            video_duration = self.video_adjuster._get_media_duration(video_path)
+            audio_duration = self.video_adjuster._get_media_duration(final_audio_path)
+            
+            self.logger.info(f"📊 Оригинальное видео: {video_duration:.2f}s")
+            self.logger.info(f"📊 Переведенное аудио: {audio_duration:.2f}s")
+            
+            duration_diff = abs(audio_duration - video_duration)
+            
+            if duration_diff < 2.0:  # Различие меньше 2 секунд
+                self.logger.info("✅ Длительности близки, адаптация не требуется")
+                Path(temp_video_path).rename(output_path)
+                return True
+            
+            # Применяем адаптивную корректировку
+            self.logger.info(f"🎛️ Применяем адаптивную корректировку (различие: {duration_diff:.1f}s)")
+            
+            # Используем сегменты для точной синхронизации если есть speaker data
+            speaker_segments = [s for s in segments if 'speaker' in s]
+            
+            success = self.video_adjuster.adjust_video_for_audio(
+                video_path, 
+                final_audio_path, 
+                output_path,
+                segments=speaker_segments if speaker_segments else None
+            )
+            
+            # Очистка временного файла
+            try:
+                Path(temp_video_path).unlink()
+            except:
+                pass
+            
+            if success:
+                self.logger.info("✅ Адаптивное видео создано успешно")
+                return True
+            else:
+                self.logger.error("❌ Ошибка создания адаптивного видео, используем базовую версию")
+                # Fallback к обычному видео
+                if Path(temp_video_path).exists():
+                    Path(temp_video_path).rename(output_path)
+                    return True
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка создания адаптивного видео: {e}")
+            return False
+    
+    def _find_combined_audio_path(self) -> Optional[str]:
+        """Ищет путь к объединенному аудио файлу"""
+        # Проверяем временные файлы
+        temp_dir = Path(self.config.TEMP_DIR)
+        
+        for audio_file in temp_dir.glob("final_audio_*.wav"):
+            return str(audio_file)
+        
+        return None
 
     def _cleanup_translation_files(self, audio_path: str, segments: List[Dict], translated_segments: List[Dict]):
         """Очистка всех временных файлов после перевода"""

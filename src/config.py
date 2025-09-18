@@ -79,6 +79,10 @@ class Config:
     FORCE_PYTTSX3_ONLY = True
     TTS_ENGINE_PRIORITY = ['pyttsx3']  # только pyttsx3
 
+    # === ЭКСПЕРИМЕНТАЛЬНЫЕ ФУНКЦИИ ===
+    USE_SPEAKER_DIARIZATION = False  # Сегментация по спикерам
+    USE_ADAPTIVE_VIDEO_TIMING = True  # Адаптивная синхронизация видео
+    
     # === ДОПОЛНИТЕЛЬНЫЕ API ===
     DEEPL_API_KEY = os.getenv('DEEPL_API_KEY')
     ELEVENLABS_API_KEY = os.getenv('ELEVENLABS_API_KEY')
