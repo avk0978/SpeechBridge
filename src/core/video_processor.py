@@ -423,11 +423,12 @@ class VideoProcessor:
                     segment_clip = video.subclip(start_time, end_time)
                     
                     # Замедляем или ускоряем видео
+                    from moviepy.video.fx.speedx import speedx
                     if speed_ratio < 1.0:  # Нужно замедлить
-                        adjusted_clip = segment_clip.fx(mp.fx.speedx, speed_ratio)
+                        adjusted_clip = segment_clip.fx(speedx, speed_ratio)
                         self.logger.info(f"Замедлен клип {start_time:.1f}-{end_time:.1f}s с коэффициентом {speed_ratio:.2f}")
                     else:  # Нужно ускорить
-                        adjusted_clip = segment_clip.fx(mp.fx.speedx, speed_ratio)
+                        adjusted_clip = segment_clip.fx(speedx, speed_ratio)
                         self.logger.info(f"Ускорен клип {start_time:.1f}-{end_time:.1f}s с коэффициентом {speed_ratio:.2f}")
                     
                     video_clips.append(adjusted_clip)
@@ -784,6 +785,239 @@ class VideoProcessor:
         except Exception as e:
             self.logger.error(f"Ошибка получения информации о видео: {e}")
             return {"error": str(e)}
+
+    def create_synchronized_video_blocks(self, original_video_path: str, 
+                                       translated_audio_segments: List[dict],
+                                       output_dir: str) -> List[str]:
+        """
+        Нарезает видео на блоки и синхронизирует каждый блок с соответствующим аудио
+        Сохраняет все части видео, включая немые сегменты в начале, середине и конце
+        
+        Args:
+            original_video_path: путь к оригинальному видео
+            translated_audio_segments: список сегментов с переведенным аудио
+            output_dir: директория для сохранения блоков
+            
+        Returns:
+            List[str]: список путей к созданным видео блокам
+        """
+        video_clips = []
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        try:
+            self.logger.info("=== СОЗДАНИЕ СИНХРОНИЗИРОВАННЫХ ВИДЕО БЛОКОВ ===")
+            
+            # Загружаем оригинальное видео
+            video = mp.VideoFileClip(original_video_path)
+            self.logger.info(f"Исходное видео: {video.duration:.2f}s")
+            
+            # Сортируем сегменты по времени начала
+            speech_segments = sorted(
+                [s for s in translated_audio_segments if s.get('translated_audio_path')], 
+                key=lambda x: x.get('start_time', 0)
+            )
+            
+            self.logger.info(f"Обрабатываем {len(speech_segments)} речевых сегментов")
+            
+            current_time = 0.0
+            block_counter = 1
+            
+            # Обрабатываем все части видео: немые + речевые
+            for i, segment in enumerate(speech_segments):
+                try:
+                    start_time = segment.get('start_time', 0)
+                    end_time = segment.get('end_time', start_time + 5)
+                    
+                    # 1. ДОБАВЛЯЕМ НЕМУЮ ЧАСТЬ ДО РЕЧЕВОГО СЕГМЕНТА
+                    if current_time < start_time:
+                        silent_duration = start_time - current_time
+                        self.logger.info(f"Немой блок {block_counter}: {current_time:.2f}-{start_time:.2f}s ({silent_duration:.2f}s)")
+                        
+                        silent_segment = video.subclip(current_time, start_time)
+                        silent_filename = f"block_{block_counter:03d}_silent.mp4"
+                        silent_path = output_dir / silent_filename
+                        
+                        silent_segment.write_videofile(
+                            str(silent_path),
+                            codec='libx264',
+                            audio_codec='aac',
+                            verbose=False,
+                            logger=None
+                        )
+                        
+                        silent_segment.close()
+                        video_clips.append(str(silent_path))
+                        block_counter += 1
+                    
+                    # 2. ОБРАБАТЫВАЕМ РЕЧЕВОЙ СЕГМЕНТ
+                    audio_path = segment.get('translated_audio_path')
+                    if not audio_path or not Path(audio_path).exists():
+                        self.logger.warning(f"Пропускаем речевой сегмент {i}: нет аудио файла")
+                        current_time = end_time
+                        continue
+                    
+                    original_duration = end_time - start_time
+                    
+                    # Получаем реальную длительность переведенного аудио
+                    from pydub import AudioSegment
+                    audio_segment = AudioSegment.from_file(audio_path)
+                    translated_duration = len(audio_segment) / 1000.0
+                    
+                    self.logger.info(f"Речевой блок {block_counter}: {start_time:.2f}-{end_time:.2f}s -> перевод {translated_duration:.2f}s")
+                    
+                    # Вырезаем соответствующий кусок видео
+                    video_segment = video.subclip(start_time, end_time)
+                    
+                    # Растягиваем или сжимаем видео под длительность аудио
+                    speed_factor = original_duration / translated_duration
+                    
+                    if abs(speed_factor - 1.0) > 0.05:  # Если разница больше 5%
+                        self.logger.info(f"  Корректируем скорость видео: фактор {speed_factor:.3f}")
+                        from moviepy.video.fx.speedx import speedx
+                        adjusted_video = video_segment.fx(speedx, speed_factor)
+                    else:
+                        adjusted_video = video_segment
+                    
+                    # Загружаем переведенное аудио
+                    translated_audio = mp.AudioFileClip(audio_path)
+                    
+                    # Объединяем видео с переведенным аудио
+                    final_segment = adjusted_video.set_audio(translated_audio)
+                    
+                    # Сохраняем блок
+                    speech_filename = f"block_{block_counter:03d}_{segment.get('speaker', 'unknown')}.mp4"
+                    speech_path = output_dir / speech_filename
+                    
+                    final_segment.write_videofile(
+                        str(speech_path),
+                        codec='libx264',
+                        audio_codec='aac',
+                        verbose=False,
+                        logger=None
+                    )
+                    
+                    # Освобождаем ресурсы
+                    video_segment.close()
+                    if 'adjusted_video' in locals():
+                        adjusted_video.close()
+                    translated_audio.close()
+                    final_segment.close()
+                    
+                    video_clips.append(str(speech_path))
+                    current_time = end_time
+                    block_counter += 1
+                    
+                except Exception as e:
+                    self.logger.error(f"❌ Ошибка создания блока {block_counter}: {e}")
+                    current_time = end_time
+                    continue
+            
+            # 3. ДОБАВЛЯЕМ ФИНАЛЬНУЮ НЕМУЮ ЧАСТЬ (если есть)
+            if current_time < video.duration:
+                final_duration = video.duration - current_time
+                self.logger.info(f"Финальный немой блок {block_counter}: {current_time:.2f}-{video.duration:.2f}s ({final_duration:.2f}s)")
+                
+                final_segment = video.subclip(current_time, video.duration)
+                final_filename = f"block_{block_counter:03d}_final_silent.mp4"
+                final_path = output_dir / final_filename
+                
+                final_segment.write_videofile(
+                    str(final_path),
+                    codec='libx264',
+                    audio_codec='aac',
+                    verbose=False,
+                    logger=None
+                )
+                
+                final_segment.close()
+                video_clips.append(str(final_path))
+            
+            video.close()
+            
+            self.logger.info(f"🎬 Создано {len(video_clips)} синхронизированных блоков")
+            return video_clips
+            
+        except Exception as e:
+            self.logger.error(f"❌ Критическая ошибка создания блоков: {e}")
+            if 'video' in locals():
+                video.close()
+            return []
+    
+    def combine_video_blocks(self, video_blocks: List[str], output_path: str) -> bool:
+        """
+        Объединяет видео блоки в финальное видео
+        
+        Args:
+            video_blocks: список путей к видео блокам
+            output_path: путь для сохранения финального видео
+            
+        Returns:
+            bool: успех операции
+        """
+        try:
+            self.logger.info("=== ОБЪЕДИНЕНИЕ ВИДЕО БЛОКОВ ===")
+            
+            if not video_blocks:
+                self.logger.error("Нет блоков для объединения")
+                return False
+            
+            # Загружаем все блоки
+            clips = []
+            total_duration = 0
+            
+            for i, block_path in enumerate(video_blocks):
+                if not Path(block_path).exists():
+                    self.logger.warning(f"Блок не найден: {block_path}")
+                    continue
+                
+                clip = mp.VideoFileClip(block_path)
+                clips.append(clip)
+                total_duration += clip.duration
+                self.logger.debug(f"Блок {i+1}: {clip.duration:.2f}s")
+            
+            if not clips:
+                self.logger.error("Не удалось загрузить ни одного блока")
+                return False
+            
+            self.logger.info(f"Объединяем {len(clips)} блоков, общая длительность: {total_duration:.2f}s")
+            
+            # Объединяем все клипы
+            final_video = mp.concatenate_videoclips(clips)
+            
+            # Сохраняем финальное видео
+            final_video.write_videofile(
+                output_path,
+                codec='libx264',
+                audio_codec='aac',
+                verbose=False,
+                logger=None
+            )
+            
+            # Освобождаем ресурсы
+            for clip in clips:
+                clip.close()
+            final_video.close()
+            
+            # Проверяем результат
+            if Path(output_path).exists():
+                file_size = Path(output_path).stat().st_size / (1024 * 1024)
+                self.logger.info(f"✅ Финальное видео создано: {output_path}")
+                self.logger.info(f"  Размер: {file_size:.1f} MB")
+                
+                # Проверяем длительность
+                test_video = mp.VideoFileClip(output_path)
+                self.logger.info(f"  Итоговая длительность: {test_video.duration:.2f}s")
+                test_video.close()
+                
+                return True
+            else:
+                self.logger.error("Финальное видео не создано")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка объединения блоков: {e}")
+            return False
 
     def __del__(self):
         """Деструктор для очистки временных файлов"""

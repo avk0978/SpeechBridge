@@ -82,6 +82,7 @@ class Config:
     # === ЭКСПЕРИМЕНТАЛЬНЫЕ ФУНКЦИИ ===
     USE_SPEAKER_DIARIZATION = True   # Сегментация по спикерам
     USE_ADAPTIVE_VIDEO_TIMING = False  # Адаптивная синхронизация видео - ОТКЛЮЧЕНО ДЛЯ ТЕСТА
+    USE_BLOCK_SYNCHRONIZATION = True  # Блочная синхронизация видео (новый подход)
     ADJUST_VIDEO_SPEED = True  # Замедление видео по сегментам для синхронизации
     
     # === ДОПОЛНИТЕЛЬНЫЕ API ===

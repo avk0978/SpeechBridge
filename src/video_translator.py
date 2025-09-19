@@ -1090,10 +1090,12 @@ class VideoTranslator:
                     self.logger.debug(
                         f"Сегмент {i + 1} переведен ({len(translated_text)} символов): {translated_text[:100]}...")
 
-                    # 3c. Синтез речи
+                    # 3c. Синтез речи с учетом voice_id сегмента
+                    voice_id = segment.get('voice_id', None)  # Получаем назначенный голос
                     tts_path = self.speech_synthesizer.synthesize_speech(
                         translated_text,
-                        self.config.TTS_LANGUAGE
+                        self.config.TTS_LANGUAGE,
+                        voice=voice_id
                     )
 
                     if tts_path:
@@ -1210,10 +1212,14 @@ class VideoTranslator:
             if progress_callback:
                 progress_callback("Создание финального видео", 85)
 
-            # 5. Создание финального видео с адаптивной синхронизацией
+            # 5. Создание финального видео с выбором метода синхронизации
             use_adaptive_timing = getattr(self.config, 'USE_ADAPTIVE_VIDEO_TIMING', True)
+            use_block_sync = getattr(self.config, 'USE_BLOCK_SYNCHRONIZATION', True)
             
-            if use_adaptive_timing:
+            if use_block_sync:
+                # Новый блочный подход с точной синхронизацией
+                success = self._create_block_synchronized_video(video_path, translated_segments, output_path)
+            elif use_adaptive_timing:
                 success = self._create_adaptive_final_video(video_path, translated_segments, output_path)
             else:
                 # Используем замедление видео по умолчанию для лучшей синхронизации
@@ -1374,6 +1380,88 @@ class VideoTranslator:
         except Exception as e:
             self.logger.error(f"❌ Ошибка создания адаптивного видео: {e}")
             return False
+    
+    def _create_block_synchronized_video(self, video_path: str, segments: List[dict], output_path: str) -> bool:
+        """
+        Создает финальное видео используя блочную синхронизацию
+        
+        Args:
+            video_path: путь к исходному видео
+            segments: обработанные сегменты с переведенным аудио
+            output_path: путь для сохранения результата
+            
+        Returns:
+            bool: успех операции
+        """
+        try:
+            self.logger.info("🎬 Создание видео с блочной синхронизацией")
+            
+            # Создаем временную директорию для блоков
+            from tempfile import mkdtemp
+            blocks_dir = mkdtemp(prefix="video_blocks_")
+            self.logger.info(f"📁 Временная директория блоков: {blocks_dir}")
+            
+            # Создаем синхронизированные блоки
+            video_blocks = self.video_processor.create_synchronized_video_blocks(
+                video_path, segments, blocks_dir
+            )
+            
+            if not video_blocks:
+                self.logger.error("❌ Не удалось создать видео блоки")
+                return False
+            
+            self.logger.info(f"✅ Создано {len(video_blocks)} синхронизированных блоков")
+            
+            # Объединяем блоки в финальное видео
+            success = self.video_processor.combine_video_blocks(video_blocks, output_path)
+            
+            if success:
+                self.logger.info("✅ Блочная синхронизация завершена успешно")
+                
+                # Показываем статистику
+                import moviepy.editor as mp
+                result_video = mp.VideoFileClip(output_path)
+                
+                total_original_duration = sum(s.get('duration', 0) for s in segments)
+                total_translated_duration = sum(self._get_audio_duration(s.get('translated_audio_path', '')) for s in segments)
+                
+                self.logger.info(f"📊 Статистика синхронизации:")
+                self.logger.info(f"   Оригинальная длительность: {total_original_duration:.2f}s")
+                self.logger.info(f"   Переведенная длительность: {total_translated_duration:.2f}s")
+                self.logger.info(f"   Финальное видео: {result_video.duration:.2f}s")
+                self.logger.info(f"   Точность синхронизации: {abs(result_video.duration - total_translated_duration):.2f}s")
+                
+                result_video.close()
+            else:
+                self.logger.error("❌ Ошибка объединения блоков")
+            
+            # Очистка временных блоков
+            try:
+                import shutil
+                shutil.rmtree(blocks_dir)
+                self.logger.debug(f"🧹 Удалена временная директория: {blocks_dir}")
+            except Exception as cleanup_error:
+                self.logger.warning(f"⚠️ Не удалось удалить временные блоки: {cleanup_error}")
+            
+            return success
+            
+        except Exception as e:
+            self.logger.error(f"❌ Критическая ошибка блочной синхронизации: {e}")
+            import traceback
+            self.logger.error(f"Трассировка:\n{traceback.format_exc()}")
+            return False
+    
+    def _get_audio_duration(self, audio_path: str) -> float:
+        """Получает длительность аудио файла"""
+        try:
+            if not audio_path or not Path(audio_path).exists():
+                return 0.0
+            
+            from pydub import AudioSegment
+            audio = AudioSegment.from_file(audio_path)
+            return len(audio) / 1000.0
+        except Exception:
+            return 0.0
     
     def _find_combined_audio_path(self) -> Optional[str]:
         """Ищет путь к объединенному аудио файлу"""

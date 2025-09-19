@@ -27,6 +27,27 @@ class SpeechSynthesizer:
         self.default_language = self.config.TTS_LANGUAGE
         self.default_voice = self.config.TTS_VOICE
         
+        # Карта голосов: voice_id -> реальное имя голоса macOS
+        # Используем только Milena с одинаковыми параметрами для всех спикеров
+        self.voice_map = {
+            'ru-male-1': 'Milena',
+            'ru-male-2': 'Milena',
+            'ru-male-3': 'Milena',
+            'ru-female-1': 'Milena',
+            'ru-female-2': 'Milena',
+            'ru-female-3': 'Milena',
+        }
+        
+        # Стандартные параметры для всех голосов (без изменения тембра)
+        self.voice_params = {
+            'ru-male-1': {'rate': 190, 'pitch_adj': 'normal'},
+            'ru-male-2': {'rate': 190, 'pitch_adj': 'normal'},
+            'ru-male-3': {'rate': 190, 'pitch_adj': 'normal'},
+            'ru-female-1': {'rate': 190, 'pitch_adj': 'normal'},
+            'ru-female-2': {'rate': 190, 'pitch_adj': 'normal'},
+            'ru-female-3': {'rate': 190, 'pitch_adj': 'normal'},
+        }
+        
         self.logger.debug("SpeechSynthesizer инициализирован")
 
     def synthesize_speech(
@@ -38,22 +59,27 @@ class SpeechSynthesizer:
             pitch: float = 0.0
     ) -> Optional[str]:
         """
-        Синтез речи ТОЛЬКО через macOS 'say' команду с голосом Milena
+        Синтез речи через macOS 'say' команду с поддержкой разных голосов
         """
         if not text or not text.strip():
             self.logger.debug("Пустой текст для синтеза")
             return None
 
         language = language or self.default_language
+        voice = voice or self.default_voice
 
         try:
-            self.logger.info(f"🎤 Синтез речи через Milena: '{text[:50]}...'")
+            # Получаем реальное имя голоса macOS и параметры
+            macos_voice = self._get_macos_voice(voice)
+            voice_params = self._get_voice_params(voice)
+            
+            self.logger.info(f"🎤 Синтез речи через {macos_voice} ({voice}): '{text[:50]}...'")
 
-            # Прямое использование macOS 'say' с голосом Milena
-            result = self._synthesize_with_say_milena(text, language)
+            # Синтез с выбранным голосом и параметрами
+            result = self._synthesize_with_say_voice_params(text, language, macos_voice, voice_params)
 
             if result:
-                self.logger.info("✅ Использован macOS 'say' с голосом Milena")
+                self.logger.info(f"✅ Использован macOS 'say' с голосом {macos_voice} (параметры: {voice_params})")
                 return result
             else:
                 self.logger.error("❌ macOS 'say' команда недоступна")
@@ -471,6 +497,182 @@ class SpeechSynthesizer:
             self.logger.error(f"pyttsx3 ошибка: {e}")
             return None
     
+    def _get_macos_voice(self, voice_id: str) -> str:
+        """
+        Получает реальное имя голоса macOS по voice_id
+        
+        Args:
+            voice_id: идентификатор голоса из системы speaker diarization
+            
+        Returns:
+            str: имя голоса macOS
+        """
+        if voice_id in self.voice_map:
+            return self.voice_map[voice_id]
+        else:
+            self.logger.warning(f"⚠️ Неизвестный voice_id: {voice_id}, используем Milena")
+            return 'Milena'
+    
+    def _get_voice_params(self, voice_id: str) -> Dict:
+        """
+        Получает параметры голоса
+        
+        Args:
+            voice_id: идентификатор голоса
+            
+        Returns:
+            Dict: параметры голоса (rate, pitch_adj)
+        """
+        if voice_id in self.voice_params:
+            return self.voice_params[voice_id]
+        else:
+            return {'rate': 190, 'pitch_adj': 'normal'}  # Стандартные параметры
+    
+    def _synthesize_with_say_voice_params(self, text: str, language: str, voice_name: str, params: Dict) -> Optional[str]:
+        """Синтез речи через macOS 'say' команду с указанным голосом и параметрами"""
+        try:
+            self.logger.info(f"🍎 Синтез через macOS 'say' с голосом {voice_name} (rate={params.get('rate', 190)})...")
+            
+            import subprocess
+            
+            # Создаем временный AIFF файл через say
+            aiff_path = self.config.get_temp_filename(f"{voice_name.lower()}_say", ".aiff")
+            
+            # Команда say с выбранным голосом и скоростью
+            cmd = [
+                'say',
+                '-v', voice_name,
+                '-r', str(params.get('rate', 190)),  # Скорость в словах/мин
+                '-o', str(aiff_path),
+                text
+            ]
+            
+            self.logger.info(f"🎙️ Создаем голос {voice_name} для: '{text[:30]}...'")
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            
+            if result.returncode != 0:
+                self.logger.warning(f"⚠️ say команда неудачна (код {result.returncode}): {result.stderr}")
+                
+                # Fallback на стандартные параметры
+                if params.get('rate', 190) != 190:
+                    self.logger.info("🔄 Fallback на стандартную скорость...")
+                    return self._synthesize_with_say_voice_params(text, language, voice_name, {'rate': 190, 'pitch_adj': 'normal'})
+                else:
+                    return None
+            
+            if not Path(aiff_path).exists():
+                self.logger.error(f"❌ AIFF файл не создан: {aiff_path}")
+                return None
+            
+            # Конвертируем AIFF в WAV через ffmpeg с обработкой высоты тона
+            wav_path = self.config.get_temp_filename(f"{voice_name.lower()}_converted", ".wav")
+            
+            # Базовая команда ffmpeg
+            ffmpeg_cmd = [
+                'ffmpeg', '-y',
+                '-i', str(aiff_path),
+                '-acodec', 'pcm_s16le',
+                '-ar', '22050',
+                '-ac', '1'
+            ]
+            
+            # Не изменяем тон - используем стандартные настройки для всех голосов
+            
+            ffmpeg_cmd.append(str(wav_path))
+            
+            ffmpeg_result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+            
+            if ffmpeg_result.returncode == 0 and Path(wav_path).exists():
+                # Удаляем временный AIFF файл
+                try:
+                    Path(aiff_path).unlink()
+                except:
+                    pass
+                
+                self.logger.info(f"✅ Создан WAV файл: {wav_path}")
+                return str(wav_path)
+            else:
+                self.logger.error(f"❌ Ошибка ffmpeg: {ffmpeg_result.stderr}")
+                return None
+                
+        except subprocess.TimeoutExpired:
+            self.logger.error("❌ Timeout при выполнении say команды")
+            return None
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка синтеза с голосом {voice_name}: {e}")
+            return None
+
+    def _synthesize_with_say_voice(self, text: str, language: str, voice_name: str) -> Optional[str]:
+        """Синтез речи через macOS 'say' команду с указанным голосом"""
+        try:
+            self.logger.info(f"🍎 Синтез через macOS 'say' с голосом {voice_name}...")
+            
+            import subprocess
+            
+            # Создаем временный AIFF файл через say
+            aiff_path = self.config.get_temp_filename(f"{voice_name.lower()}_say", ".aiff")
+            
+            # Команда say с выбранным голосом
+            cmd = [
+                'say',
+                '-v', voice_name,
+                '-o', str(aiff_path),
+                text
+            ]
+            
+            self.logger.info(f"🎙️ Создаем голос {voice_name} для: '{text[:30]}...'")
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            
+            if result.returncode != 0:
+                self.logger.warning(f"⚠️ say команда неудачна (код {result.returncode}): {result.stderr}")
+                
+                # Fallback на Milena если голос не найден
+                if voice_name != 'Milena':
+                    self.logger.info("🔄 Fallback на голос Milena...")
+                    return self._synthesize_with_say_voice(text, language, 'Milena')
+                else:
+                    return None
+            
+            if not Path(aiff_path).exists():
+                self.logger.error(f"❌ AIFF файл не создан: {aiff_path}")
+                return None
+            
+            # Конвертируем AIFF в WAV через ffmpeg
+            wav_path = self.config.get_temp_filename(f"{voice_name.lower()}_converted", ".wav")
+            
+            ffmpeg_cmd = [
+                'ffmpeg', '-y',
+                '-i', str(aiff_path),
+                '-acodec', 'pcm_s16le',
+                '-ar', '22050',
+                '-ac', '1',
+                str(wav_path)
+            ]
+            
+            ffmpeg_result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+            
+            if ffmpeg_result.returncode == 0 and Path(wav_path).exists():
+                # Удаляем временный AIFF файл
+                try:
+                    Path(aiff_path).unlink()
+                except:
+                    pass
+                
+                self.logger.info(f"✅ Создан WAV файл: {wav_path}")
+                return str(wav_path)
+            else:
+                self.logger.error(f"❌ Ошибка ffmpeg: {ffmpeg_result.stderr}")
+                return None
+                
+        except subprocess.TimeoutExpired:
+            self.logger.error("❌ Timeout при выполнении say команды")
+            return None
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка синтеза с голосом {voice_name}: {e}")
+            return None
+
     def _synthesize_with_say_milena(self, text: str, language: str) -> Optional[str]:
         """Основной метод синтеза через macOS 'say' команду с голосом Milena"""
         try:
