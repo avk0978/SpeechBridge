@@ -139,7 +139,7 @@ except Exception as e:
                 ["python", script_path],
                 capture_output=True,
                 text=True,
-                timeout=300,  # 5 минут таймаут
+                timeout=900,  # 15 минут таймаут для длинных сегментов
                 env={**os.environ, "PYTHONPATH": ""}  # Чистое окружение
             )
             

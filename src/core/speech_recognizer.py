@@ -71,12 +71,12 @@ class SpeechRecognizer:
         self.available_engines = self._test_engines_availability()
 
         # Конфигурация доступных моделей
-        self.whisper_models = ["tiny", "base", "small", "medium", "large"]
+        self.whisper_models = ["tiny", "base", "small", "medium", "large", "large-v2", "large-v3"]
         self.recognition_engines = ["whisper", "google", "sphinx"]
         
         # Текущие настройки (можно изменять через API)
-        # Используем tiny для Intel Mac для лучшей производительности
-        self.current_whisper_model = getattr(self.config, 'WHISPER_MODEL', 'tiny')
+        # Используем base как сбалансированную модель по умолчанию
+        self.current_whisper_model = getattr(self.config, 'WHISPER_MODEL', 'base')
         self.preferred_engine = getattr(self.config, 'PREFERRED_RECOGNITION_ENGINE', 'whisper')
         
         self.logger.info(f"SpeechRecognizer инициализирован. Доступные движки: {list(self.available_engines.keys())}")
@@ -493,7 +493,7 @@ except Exception as e:
                     
                     result = subprocess.run([
                         python_path, script_path
-                    ], capture_output=True, text=True, timeout=600)  # 10 минут таймаут для длинных сегментов
+                    ], capture_output=True, text=True, timeout=1800)  # 30 минут таймаут для длинных сегментов
                     
                     elapsed = time.time() - start_time
                     self.logger.info(f"⏱️ Subprocess завершился за {elapsed:.1f}s")

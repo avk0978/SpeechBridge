@@ -148,7 +148,8 @@ class VideoProcessor:
                     translated_audio_segments,
                     video.duration,
                     preserve_original_audio,
-                    video.audio if preserve_original_audio else None
+                    video.audio if preserve_original_audio else None,
+                    original_video_path
                 )
 
                 if final_audio_path and Path(final_audio_path).exists():
@@ -497,120 +498,206 @@ class VideoProcessor:
             return 0.0
 
     def _combine_translated_audio(self, segments: List[dict], video_duration: float,
-                                  preserve_original: bool = False, original_audio=None) -> Optional[str]:
+                                  preserve_original: bool = False, original_audio=None, original_video_path: str = None) -> Optional[str]:
         """
-        Объединяет переведенные аудио сегменты в единую дорожку
+        Объединяет переведенные аудио сегменты в единую дорожку с учетом VAD
 
         Args:
             segments: список сегментов с переведенным аудио
             video_duration: длительность оригинального видео
             preserve_original: микшировать с оригинальным аудио
             original_audio: оригинальная аудио дорожка
+            original_video_path: путь к оригинальному видео для анализа
 
         Returns:
             str: путь к объединенному аудио файлу
         """
         try:
-            self.logger.info(f"=== ДИАГНОСТИКА ВХОДНЫХ СЕГМЕНТОВ ===")
+            self.logger.info(f"🔊 === СОЗДАНИЕ АУДИО ДОРОЖКИ С VAD ФИЛЬТРАЦИЕЙ ===")
+            self.logger.info(f"📊 Получено сегментов: {len(segments)}")
+            self.logger.info(f"📊 Длительность видео: {video_duration:.2f}s")
+            
+            self.logger.info(f"=== ДИАГНОСТИКА ВХОДНЫХ СЕГМЕНТОВ С VAD ===")
             for i, segment in enumerate(segments):
-                self.logger.info(f"Сегмент {i}: success={segment.get('success')}, "
+                start_time = segment.get('start_time', 0)
+                end_time = segment.get('end_time', 0)
+                self.logger.info(f"Сегмент {i} [{start_time:.1f}-{end_time:.1f}s]: success={segment.get('success')}, "
                                  f"status={segment.get('status')}, "
+                                 f"vad_is_speech={segment.get('vad_is_speech')}, "
                                  f"audio_path={segment.get('translated_audio_path')}")
                 if segment.get('translated_audio_path'):
                     exists = Path(segment['translated_audio_path']).exists()
                     self.logger.info(f"  Файл существует: {exists}")
-            #         ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-            # ИСПРАВЛЕНИЕ: Создаем адаптивное аудио, которое расширяется по необходимости
-            # Сначала определяем максимальную длительность всех сегментов
+            
+            # НОВАЯ ЛОГИКА: Создаем пустое аудио только нужной длительности
+            # Сначала определяем максимальную длительность всех РЕЧЕВЫХ сегментов с учетом VAD
+            speech_segments = []
             max_end_time = 0
-            for segment in segments:
+            
+            for i, segment in enumerate(segments):
+                start_time = segment.get('start_time', 0)
+                end_time = segment.get('end_time', 0)
+                vad_is_speech = segment.get('vad_is_speech', True)
+                status = segment.get('status', '')
+                
+                # Проверяем VAD результат - пропускаем сегменты без речи
+                if not vad_is_speech or status == 'no_speech_vad':
+                    self.logger.info(f"❌ ПРОПУСКАЕМ сегмент {i} [{start_time:.1f}-{end_time:.1f}s]: VAD={vad_is_speech}, status={status}")
+                    continue
+                
+                self.logger.info(f"✅ ВКЛЮЧАЕМ речевой сегмент {i} [{start_time:.1f}-{end_time:.1f}s]: VAD={vad_is_speech}")
                 if segment.get('end_time'):
                     max_end_time = max(max_end_time, segment.get('end_time', 0))
+                    speech_segments.append(segment)
             
-            # Создаем базовую тишину с запасом для сохранения всего контента
-            base_duration = max(video_duration, max_end_time + 30)  # +30сек запаса
-            final_audio = AudioSegment.silent(duration=int(base_duration * 1000))
+            if not speech_segments:
+                self.logger.warning("❌ Нет речевых сегментов после VAD фильтрации")
+                return None
             
-            self.logger.info(f"📏 Базовая длительность аудио: {base_duration:.2f}s (видео: {video_duration:.2f}s, макс сегмент: {max_end_time:.2f}s)")
-            self.logger.info(f"Объединение {len(segments)} аудио сегментов...")
+            # НОВАЯ ЛОГИКА: Создаем аудио дорожку ТОЛЬКО из речевых сегментов без базовой тишины
+            # Определяем общую длительность на основе максимального времени окончания речевых сегментов
+            if not speech_segments:
+                self.logger.warning("❌ Нет речевых сегментов для создания аудио")
+                return None
+            
+            # Находим самый поздний речевой сегмент
+            max_speech_end = max(seg.get('end_time', 0) for seg in speech_segments)
+            
+            # Создаем пустые аудио сегменты только в промежутках между речью
+            audio_segments = []
+            current_time = 0.0
+            
+            self.logger.info(f"📏 Создание аудио только для речевых сегментов (до {max_speech_end:.2f}s)")
+            self.logger.info(f"Обработка {len(speech_segments)} речевых сегментов...")
 
-            successful_segments = 0
-            for segment in segments:
+            # Сортируем речевые сегменты по времени начала
+            speech_segments.sort(key=lambda x: x.get('start_time', 0))
+            
+            # Проверяем, начинается ли первый сегмент с самого начала видео
+            first_segment_start = speech_segments[0].get('start_time', 0) if speech_segments else 0
+            
+            # ПРИНУДИТЕЛЬНАЯ ПРОВЕРКА ОРИГИНАЛЬНОГО АУДИО: 
+            # анализируем оригинальное аудио видео, чтобы найти где действительно начинается речь
+            detected_silence_duration = 0
+            if first_segment_start == 0.0 and original_video_path and speech_segments:
+                self.logger.info(f"🔍 АНАЛИЗИРУЕМ оригинальное аудио для поиска начала речи...")
                 try:
-                    # Более надежная проверка сегмента
+                    # Загружаем оригинальное аудио из видео
+                    import moviepy.editor as mp
+                    with mp.VideoFileClip(original_video_path) as video:
+                        if video.audio:
+                            # Сохраняем первые 60 секунд оригинального аудио во временный файл
+                            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_orig:
+                                try:
+                                    audio_clip = video.audio.subclip(0, min(60, video.duration))
+                                    audio_clip.write_audiofile(tmp_orig.name, verbose=False, logger=None)
+                                    audio_clip.close()
+                                    
+                                    # Анализируем оригинальное аудио на предмет начала речи
+                                    orig_audio = AudioSegment.from_file(tmp_orig.name)
+                                    self.logger.info(f"🎵 Анализируем первые {len(orig_audio)/1000:.1f}s оригинального аудио")
+                                    
+                                    # Ищем где начинается значимый сигнал (речь)
+                                    for ms in range(0, min(len(orig_audio), 45000), 500):  # Проверяем каждые 0.5с до 45с
+                                        segment_500ms = orig_audio[ms:ms+500]
+                                        if len(segment_500ms) > 0 and segment_500ms.dBFS > -35:  # Нормальный уровень звука
+                                            detected_silence_duration = ms
+                                            self.logger.info(f"🔇 НАЙДЕНО начало речи в оригинале на {ms/1000:.1f}s")
+                                            break
+                                    
+                                    if detected_silence_duration == 0:
+                                        self.logger.info(f"🎤 В оригинальном аудио речь идет с самого начала")
+                                    
+                                    Path(tmp_orig.name).unlink()  # Удаляем временный файл
+                                    
+                                except Exception as e:
+                                    self.logger.warning(f"Ошибка анализа оригинального аудио: {e}")
+                        else:
+                            self.logger.warning(f"Оригинальное видео не содержит аудио")
+                except Exception as e:
+                    self.logger.warning(f"Ошибка загрузки оригинального видео: {e}")
+            
+            # Если обнаружена тишина в оригинале, добавляем её
+            if detected_silence_duration > 0:
+                self.logger.info(f"🔇 ДОБАВЛЯЕМ ДЕТЕКТИРОВАННУЮ ТИШИНУ: 0.0-{detected_silence_duration/1000:.1f}s")
+                audio_segments.append(AudioSegment.silent(duration=detected_silence_duration))
+                current_time = detected_silence_duration / 1000.0
+            elif first_segment_start == 0.0 and speech_segments:
+                # Дополнительная проверка переведенного файла (оригинальная логика)
+                first_audio_path = speech_segments[0].get('translated_audio_path')
+                if first_audio_path and Path(first_audio_path).exists():
+                    # Анализируем начало первого сегмента на наличие тишины
+                    try:
+                        first_audio = AudioSegment.from_file(first_audio_path)
+                        # Проверяем первые 5 секунд аудио на наличие значимого сигнала
+                        if len(first_audio) > 5000:  # Если сегмент больше 5 секунд
+                            first_5_seconds = first_audio[:5000]  # Первые 5 секунд
+                            if first_5_seconds.dBFS < -50:  # Очень тихий сигнал
+                                # Найдем где начинается реальный сигнал
+                                for ms in range(0, min(len(first_audio), 30000), 1000):  # Проверяем до 30 секунд
+                                    segment_1s = first_audio[ms:ms+1000]
+                                    if segment_1s.dBFS > -40:  # Нашли нормальный сигнал
+                                        silence_duration = ms
+                                        self.logger.info(f"🔇 ОБНАРУЖЕНА ТИШИНА в начале первого сегмента: добавляем {silence_duration/1000:.1f}s тишины")
+                                        audio_segments.append(AudioSegment.silent(duration=silence_duration))
+                                        current_time = silence_duration / 1000.0
+                                        break
+                            else:
+                                self.logger.info(f"🎤 Первый сегмент содержит сигнал с начала - тишина не нужна")
+                        else:
+                            self.logger.info(f"🎤 Первый сегмент слишком короткий для анализа")
+                    except Exception as e:
+                        self.logger.warning(f"Ошибка анализа первого сегмента: {e}")
+                        
+            elif first_segment_start > 0:
+                initial_silence_duration = first_segment_start * 1000  # в мс
+                self.logger.info(f"🔇 ДОБАВЛЯЕМ НАЧАЛЬНУЮ ТИШИНУ: 0.0-{first_segment_start:.1f}s ({initial_silence_duration/1000:.1f}s)")
+                audio_segments.append(AudioSegment.silent(duration=int(initial_silence_duration)))
+                current_time = first_segment_start
+            else:
+                self.logger.info(f"🎤 Первый речевой сегмент начинается с {first_segment_start:.1f}s - проверим на принудительную тишину")
+            
+            successful_segments = 0
+            for segment in speech_segments:
+                try:
+                    # Проверяем только речевые сегменты
                     audio_path = segment.get('translated_audio_path')
                     success = segment.get('success')
                     status = segment.get('status')
 
                     # Проверяем наличие аудио файла и успешность обработки
-                    if not audio_path:
-                        self.logger.debug(f"Пропуск сегмента: нет translated_audio_path")
+                    if not audio_path or not Path(audio_path).exists():
+                        self.logger.debug(f"Пропуск сегмента: нет аудио файла")
                         continue
 
-                    if not Path(audio_path).exists():
-                        self.logger.warning(f"Пропуск сегмента: файл не найден {audio_path}")
-                        continue
-
-                    # Проверяем статус успешности (более гибко)
+                    # Проверяем статус успешности
                     if success is False or status == 'error' or status == 'no_speech':
                         self.logger.debug(f"Пропуск сегмента: success={success}, status={status}")
                         continue
 
-                    self.logger.debug(f"Обработка валидного сегмента: {audio_path}")
-
-                    # if not segment.get('translated_audio_path') or not segment.get('success', False):
-                    #     continue
-
-                    audio_path = segment['translated_audio_path']
-                    if not Path(audio_path).exists():
-                        self.logger.warning(f"Переведенный аудио файл не найден: {audio_path}")
-                        continue
-
                     # Загружаем переведенный сегмент
                     segment_audio = AudioSegment.from_file(audio_path)
-                    self.logger.debug(f"Загружен сегмент аудио: длительность={len(segment_audio)}ms, громкость={segment_audio.dBFS:.1f}dBFS")
-
-                    # Получаем временные метки
-                    start_time = segment.get('start_time', 0) * 1000  # в миллисекундах
-                    end_time = segment.get('end_time', start_time / 1000 + len(segment_audio) / 1000) * 1000
-
-                    # ИСПРАВЛЕНИЕ: НЕ ОБРЕЗАЕМ аудио для сохранения смысла
-                    # Если аудио длиннее исходного сегмента, расширяем базовое аудио
-                    actual_segment_duration = len(segment_audio)
-                    original_duration = end_time - start_time
+                    start_time = segment.get('start_time', 0)
+                    end_time = segment.get('end_time', start_time + len(segment_audio) / 1000.0)
                     
-                    if actual_segment_duration > original_duration:
-                        # Расширяем базовое аудио если нужно
-                        required_length = int(start_time + actual_segment_duration)
-                        if required_length > len(final_audio):
-                            extension_needed = required_length - len(final_audio)
-                            final_audio = final_audio + AudioSegment.silent(duration=extension_needed)
-                            self.logger.info(f"🔄 Расширили базовое аудио на {extension_needed/1000:.1f}s для сохранения всего контента")
-                        
-                        # Обновляем end_time для корректной замены
-                        end_time = start_time + actual_segment_duration
+                    self.logger.debug(f"Обработка сегмента {start_time:.1f}-{end_time:.1f}s: {len(segment_audio)}ms")
 
-                    # Нормализуем сегмент перед добавлением, если он очень тихий
+                    # Добавляем тишину от текущего времени до начала сегмента (если есть пропуск)
+                    if current_time < start_time:
+                        silence_duration = (start_time - current_time) * 1000  # в мс
+                        self.logger.debug(f"Добавляем тишину: {current_time:.1f}-{start_time:.1f}s ({silence_duration/1000:.1f}s)")
+                        audio_segments.append(AudioSegment.silent(duration=int(silence_duration)))
+
+                    # Нормализуем сегмент если очень тихий
                     if segment_audio.dBFS < -50:
                         segment_audio = segment_audio.normalize(headroom=20.0)
-                        self.logger.info(f"Сегмент нормализован: {segment_audio.dBFS:.1f}dBFS")
 
-                    # Заменяем участок тишины на аудио (более надежно чем overlay)
-                    try:
-                        # Разбиваем финальное аудио на три части: до, вместо, после
-                        before = final_audio[:int(start_time)]
-                        after = final_audio[int(end_time):]
-                        
-                        # Собираем финальное аудио
-                        final_audio = before + segment_audio + after
-                        successful_segments += 1
-                        
-                        self.logger.debug(f"Сегмент заменен: {start_time / 1000:.1f}-{end_time / 1000:.1f}s, итоговая громкость={final_audio.dBFS:.1f}dBFS")
-                    except Exception as overlay_error:
-                        # Fallback на старый метод
-                        self.logger.warning(f"Замена не удалась, используем overlay: {overlay_error}")
-                        final_audio = final_audio.overlay(segment_audio, position=int(start_time))
-                        successful_segments += 1
+                    # Добавляем речевой сегмент
+                    audio_segments.append(segment_audio)
+                    current_time = end_time
+                    successful_segments += 1
+                    
+                    self.logger.debug(f"Добавлен речевой сегмент: {start_time:.1f}-{end_time:.1f}s")
 
                 except Exception as e:
                     self.logger.warning(f"Ошибка обработки сегмента: {e}")
@@ -619,6 +706,22 @@ class VideoProcessor:
             if successful_segments == 0:
                 self.logger.warning("Ни один сегмент не был успешно добавлен")
                 return None
+
+            # Объединяем все аудио сегменты
+            if not audio_segments:
+                self.logger.warning("Нет аудио сегментов для объединения")
+                return None
+                
+            self.logger.info(f"Объединение {len(audio_segments)} аудио сегментов...")
+            final_audio = audio_segments[0]
+            for segment in audio_segments[1:]:
+                final_audio = final_audio + segment
+
+            # Добавляем тишину в конце до полной длительности видео (если речь закончилась раньше)
+            if current_time < video_duration:
+                end_silence_duration = (video_duration - current_time) * 1000  # в мс
+                self.logger.info(f"Добавляем финальную тишину: {current_time:.1f}-{video_duration:.1f}s ({end_silence_duration/1000:.1f}s)")
+                final_audio = final_audio + AudioSegment.silent(duration=int(end_silence_duration))
 
             # Микширование с оригинальным аудио если нужно
             if preserve_original and original_audio:
@@ -791,7 +894,7 @@ class VideoProcessor:
                                        output_dir: str) -> List[str]:
         """
         Нарезает видео на блоки и синхронизирует каждый блок с соответствующим аудио
-        Сохраняет все части видео, включая немые сегменты в начале, середине и конце
+        Сохраняет только части видео с речью (согласно VAD), пропускает части без речи
         
         Args:
             original_video_path: путь к оригинальному видео
@@ -806,55 +909,42 @@ class VideoProcessor:
         output_dir.mkdir(parents=True, exist_ok=True)
         
         try:
-            self.logger.info("=== СОЗДАНИЕ СИНХРОНИЗИРОВАННЫХ ВИДЕО БЛОКОВ ===")
+            self.logger.info("=== СОЗДАНИЕ СИНХРОНИЗИРОВАННЫХ ВИДЕО БЛОКОВ С VAD ===")
             
             # Загружаем оригинальное видео
             video = mp.VideoFileClip(original_video_path)
             self.logger.info(f"Исходное видео: {video.duration:.2f}s")
             
-            # Сортируем сегменты по времени начала
+            # Фильтруем сегменты по VAD - оставляем только с речью
             speech_segments = sorted(
-                [s for s in translated_audio_segments if s.get('translated_audio_path')], 
+                [s for s in translated_audio_segments 
+                 if s.get('translated_audio_path') and s.get('vad_is_speech', True) and s.get('status') != 'no_speech_vad'], 
                 key=lambda x: x.get('start_time', 0)
             )
             
-            self.logger.info(f"Обрабатываем {len(speech_segments)} речевых сегментов")
+            self.logger.info(f"Обрабатываем {len(speech_segments)} речевых сегментов (после VAD фильтрации)")
             
-            current_time = 0.0
+            # Показываем какие сегменты пропускаем
+            skipped_segments = [s for s in translated_audio_segments 
+                              if not s.get('vad_is_speech', True) or s.get('status') == 'no_speech_vad']
+            for segment in skipped_segments:
+                start = segment.get('start_time', 0)
+                end = segment.get('end_time', 0)
+                reason = segment.get('vad_reason', 'нет VAD данных')
+                self.logger.info(f"⏭️ Пропускаем сегмент {start:.1f}-{end:.1f}s: {reason}")
+            
             block_counter = 1
             
-            # Обрабатываем все части видео: немые + речевые
+            # Обрабатываем только речевые сегменты (VAD уже отфильтровал немые части)
             for i, segment in enumerate(speech_segments):
                 try:
                     start_time = segment.get('start_time', 0)
                     end_time = segment.get('end_time', start_time + 5)
                     
-                    # 1. ДОБАВЛЯЕМ НЕМУЮ ЧАСТЬ ДО РЕЧЕВОГО СЕГМЕНТА
-                    if current_time < start_time:
-                        silent_duration = start_time - current_time
-                        self.logger.info(f"Немой блок {block_counter}: {current_time:.2f}-{start_time:.2f}s ({silent_duration:.2f}s)")
-                        
-                        silent_segment = video.subclip(current_time, start_time)
-                        silent_filename = f"block_{block_counter:03d}_silent.mp4"
-                        silent_path = output_dir / silent_filename
-                        
-                        silent_segment.write_videofile(
-                            str(silent_path),
-                            codec='libx264',
-                            audio_codec='aac',
-                            verbose=False,
-                            logger=None
-                        )
-                        
-                        silent_segment.close()
-                        video_clips.append(str(silent_path))
-                        block_counter += 1
-                    
-                    # 2. ОБРАБАТЫВАЕМ РЕЧЕВОЙ СЕГМЕНТ
+                    # ОБРАБАТЫВАЕМ ТОЛЬКО РЕЧЕВОЙ СЕГМЕНТ (без немых частей)
                     audio_path = segment.get('translated_audio_path')
                     if not audio_path or not Path(audio_path).exists():
                         self.logger.warning(f"Пропускаем речевой сегмент {i}: нет аудио файла")
-                        current_time = end_time
                         continue
                     
                     original_duration = end_time - start_time
@@ -905,33 +995,11 @@ class VideoProcessor:
                     final_segment.close()
                     
                     video_clips.append(str(speech_path))
-                    current_time = end_time
                     block_counter += 1
                     
                 except Exception as e:
                     self.logger.error(f"❌ Ошибка создания блока {block_counter}: {e}")
-                    current_time = end_time
                     continue
-            
-            # 3. ДОБАВЛЯЕМ ФИНАЛЬНУЮ НЕМУЮ ЧАСТЬ (если есть)
-            if current_time < video.duration:
-                final_duration = video.duration - current_time
-                self.logger.info(f"Финальный немой блок {block_counter}: {current_time:.2f}-{video.duration:.2f}s ({final_duration:.2f}s)")
-                
-                final_segment = video.subclip(current_time, video.duration)
-                final_filename = f"block_{block_counter:03d}_final_silent.mp4"
-                final_path = output_dir / final_filename
-                
-                final_segment.write_videofile(
-                    str(final_path),
-                    codec='libx264',
-                    audio_codec='aac',
-                    verbose=False,
-                    logger=None
-                )
-                
-                final_segment.close()
-                video_clips.append(str(final_path))
             
             video.close()
             
