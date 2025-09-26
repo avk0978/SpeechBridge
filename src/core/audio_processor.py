@@ -29,16 +29,18 @@ class AudioProcessor:
         audio_path: str, 
         min_silence_len: Optional[int] = None,
         silence_thresh: Optional[int] = None,
-        keep_silence: Optional[int] = None
+        keep_silence: Optional[int] = None,
+        max_segment_duration: Optional[float] = None
     ) -> List[Dict]:
         """
-        Сегментация аудио по паузам
+        Сегментация аудио по паузам с принудительным разбиением длинных сегментов
         
         Args:
             audio_path: путь к аудио файлу
             min_silence_len: минимальная длительность паузы (мс)
             silence_thresh: порог тишины (дБ)
             keep_silence: сколько тишины оставлять (мс)
+            max_segment_duration: максимальная длительность сегмента (сек)
             
         Returns:
             list: список сегментов с метаданными
@@ -54,6 +56,7 @@ class AudioProcessor:
             min_silence_len = min_silence_len or self.config.MIN_SILENCE_LEN
             silence_thresh = silence_thresh or self.config.SILENCE_THRESH
             keep_silence = keep_silence or self.config.KEEP_SILENCE
+            max_segment_duration = max_segment_duration or self.config.MAX_SEGMENT_DURATION
             
             # Загрузка аудио
             audio = AudioSegment.from_wav(audio_path)
@@ -85,6 +88,25 @@ class AudioProcessor:
                 keep_silence=keep_silence
             )
             
+            # Принудительное разбиение длинных сегментов
+            max_segment_ms = int(max_segment_duration * 1000)
+            final_chunks = []
+            
+            for chunk in chunks:
+                if len(chunk) <= max_segment_ms:
+                    final_chunks.append(chunk)
+                else:
+                    # Разбиваем длинный сегмент на части
+                    self.logger.debug(f"📏 Разбиваем длинный сегмент: {len(chunk)/1000:.1f}s -> части по {max_segment_duration}s")
+                    
+                    start_ms = 0
+                    while start_ms < len(chunk):
+                        end_ms = min(start_ms + max_segment_ms, len(chunk))
+                        sub_chunk = chunk[start_ms:end_ms]
+                        final_chunks.append(sub_chunk)
+                        start_ms = end_ms
+            
+            chunks = final_chunks
             segments = []
             # Начинаем отсчет с учетом начальной тишины
             current_time = initial_silence_duration

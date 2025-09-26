@@ -20,7 +20,7 @@ except Exception:
 import logging
 import time
 import subprocess
-from typing import Optional, Dict, List, Callable
+from typing import Optional, Dict, List, Callable, Tuple
 import json
 from datetime import datetime
 from pathlib import Path
@@ -29,6 +29,7 @@ from pathlib import Path
 from core import VideoProcessor, AudioProcessor, SpeechRecognizer, SpeechSynthesizer
 from core.speaker_diarization import SpeakerDiarization
 from core.video_time_adjuster import VideoTimeAdjuster
+from core.voice_activity_detector import VoiceActivityDetector
 from translator_compat import translate_text, get_translator_status
 from config import config
 
@@ -46,6 +47,7 @@ class VideoTranslator:
         self.speech_synthesizer = SpeechSynthesizer()
         self.speaker_diarization = SpeakerDiarization(config)
         self.video_adjuster = VideoTimeAdjuster(config)
+        self.voice_activity_detector = VoiceActivityDetector()
 
         # Создание рабочих директорий
         self.config.create_directories()
@@ -168,16 +170,30 @@ class VideoTranslator:
                 return result.strip()
             else:
                 if is_manual_selection:
-                    raise ValueError(f"Движок {engine} не смог распознать аудио в файле {audio_path}")
+                    # Проверяем, не является ли это коротким сегментом
+                    import os
+                    file_size = os.path.getsize(audio_path) if os.path.exists(audio_path) else 0
+                    if file_size < 10000:  # файл меньше 10KB
+                        self.logger.warning(f"⚠️ Очень короткий аудио файл ({file_size} bytes), пропускаем")
+                        return ""  # Возвращаем пустую строку вместо ошибки
+                    else:
+                        raise ValueError(f"Движок {engine} не смог распознать аудио в файле {audio_path}")
                 else:
                     self.logger.warning(f"⚠️ Движок {engine} не вернул результат")
                     return ""
                 
         except Exception as e:
             if is_manual_selection:
-                error_msg = f"Движок {engine} не работает: {str(e)}"
-                self.logger.error(f"❌ {error_msg}")
-                raise ValueError(error_msg)
+                # Проверяем, не является ли это коротким или проблемным сегментом
+                import os
+                file_size = os.path.getsize(audio_path) if os.path.exists(audio_path) else 0
+                if file_size < 10000:  # файл меньше 10KB
+                    self.logger.warning(f"⚠️ Очень короткий аудио файл ({file_size} bytes), пропускаем ошибку: {e}")
+                    return ""  # Возвращаем пустую строку вместо критической ошибки
+                else:
+                    error_msg = f"Движок {engine} не работает: {str(e)}"
+                    self.logger.error(f"❌ {error_msg}")
+                    raise ValueError(error_msg)
             else:
                 self.logger.warning(f"⚠️ Ошибка движка {engine}: {e}")
                 return ""
@@ -919,6 +935,56 @@ class VideoTranslator:
             millisecs = int((seconds % 1) * 1000)
             return f"{hours:02d}:{minutes:02d}:{secs:02d},{millisecs:03d}"
         
+        def format_subtitle_text(text: str, max_chars_per_line: int = 60) -> str:
+            """Форматирование текста субтитров для удобочитаемости"""
+            if not text or len(text) <= max_chars_per_line:
+                return text
+            
+            # Разбиваем на предложения
+            sentences = text.replace('. ', '.\n').replace('! ', '!\n').replace('? ', '?\n').split('\n')
+            
+            formatted_lines = []
+            current_line = ""
+            
+            for sentence in sentences:
+                sentence = sentence.strip()
+                if not sentence:
+                    continue
+                    
+                # Если предложение помещается в текущую строку
+                if len(current_line) + len(sentence) + 1 <= max_chars_per_line:
+                    if current_line:
+                        current_line += " " + sentence
+                    else:
+                        current_line = sentence
+                else:
+                    # Сохраняем текущую строку и начинаем новую
+                    if current_line:
+                        formatted_lines.append(current_line)
+                    
+                    # Если предложение слишком длинное, разбиваем его по словам
+                    if len(sentence) > max_chars_per_line:
+                        words = sentence.split(' ')
+                        current_line = ""
+                        for word in words:
+                            if len(current_line) + len(word) + 1 <= max_chars_per_line:
+                                if current_line:
+                                    current_line += " " + word
+                                else:
+                                    current_line = word
+                            else:
+                                if current_line:
+                                    formatted_lines.append(current_line)
+                                current_line = word
+                    else:
+                        current_line = sentence
+            
+            # Добавляем последнюю строку
+            if current_line:
+                formatted_lines.append(current_line)
+            
+            return '\n'.join(formatted_lines)
+        
         srt_content = []
         subtitle_index = 1
         
@@ -931,15 +997,15 @@ class VideoTranslator:
             
             # Определяем текст субтитров
             if subtitle_type == "original":
-                subtitle_text = original_text or '[речь не распознана]'
+                subtitle_text = format_subtitle_text(original_text or '[речь не распознана]')
             elif subtitle_type == "translated":
-                subtitle_text = translated_text or '[нет перевода]'
+                subtitle_text = format_subtitle_text(translated_text or '[нет перевода]')
             elif subtitle_type == "dual":
                 lines = []
                 if original_text:
-                    lines.append(f"EN: {original_text}")
+                    lines.append(f"EN: {format_subtitle_text(original_text, 50)}")
                 if translated_text:
-                    lines.append(f"RU: {translated_text}")
+                    lines.append(f"RU: {format_subtitle_text(translated_text, 50)}")
                 subtitle_text = '\n'.join(lines) if lines else '[нет текста]'
             
             # Добавляем в SRT
@@ -955,8 +1021,8 @@ class VideoTranslator:
             f.write('\n'.join(srt_content))
 
     def translate_video(self, video_path: str, output_path: str, progress_callback: Callable = None,
-                        save_texts: bool = True, speech_engine: str = 'auto', 
-                        output_format: str = 'TRANSLATION_ONLY') -> bool:
+                        save_texts: bool = True, speech_engine: str = 'whisper', 
+                        whisper_model: str = 'base', output_format: str = 'TRANSLATION_ONLY') -> bool:
         """
         Основная функция перевода видео с сохранением текстов
 
@@ -965,7 +1031,8 @@ class VideoTranslator:
             output_path: путь для сохранения результата
             progress_callback: функция для отслеживания прогресса
             save_texts: сохранять ли текстовые результаты
-            speech_engine: предпочтительный движок распознавания ('auto', 'whisper', 'google', 'sphinx')
+            speech_engine: движок распознавания (только 'whisper')
+            whisper_model: модель Whisper ('tiny', 'base', 'small', 'medium', 'large', 'large-v2', 'large-v3')
             output_format: формат вывода ('TRANSLATION_ONLY', 'SUBTITLES_ONLY', 'TRANSLATION_WITH_SUBTITLES')
 
         Returns:
@@ -975,7 +1042,12 @@ class VideoTranslator:
 
         try:
             self.logger.info(f"Начало перевода видео: {video_path} -> {output_path}")
-            self.logger.info(f"📋 Настройки: движок={speech_engine}, формат={output_format}")
+            self.logger.info(f"📋 Настройки: движок={speech_engine}, модель={whisper_model}, формат={output_format}")
+            
+            # Устанавливаем модель Whisper в SpeechRecognizer
+            if hasattr(self.speech_recognizer, 'set_whisper_model'):
+                self.speech_recognizer.set_whisper_model(whisper_model)
+                self.logger.info(f"🎯 Установлена модель Whisper: {whisper_model}")
             
             # Логика выбора движка распознавания
             if speech_engine == 'auto':
@@ -1038,6 +1110,16 @@ class VideoTranslator:
                 return False
                 
             self.logger.info(f"✅ Создано {len(segments)} сегментов по паузам")
+            
+            # Применяем Voice Activity Detection для фильтрации сегментов без речи
+            if progress_callback:
+                progress_callback("Анализ речевой активности", 18)
+            
+            self.logger.info("🎤 Применяем Voice Activity Detection...")
+            segments = self.voice_activity_detector.filter_speech_segments(segments, min_confidence=0.4)
+            
+            speech_segments = [s for s in segments if s.get('vad_is_speech', True)]
+            self.logger.info(f"🎯 После VAD: {len(speech_segments)}/{len(segments)} сегментов содержат речь")
 
             # 3. Обработка каждого сегмента
             translated_segments = []
@@ -1053,6 +1135,19 @@ class VideoTranslator:
 
                     segment_start_time = time.time()
                     self.logger.debug(f"Обработка сегмента {i + 1}/{total_segments}")
+
+                    # Проверяем результат VAD - пропускаем сегменты без речи
+                    if segment.get('status') == 'no_speech_vad' or not segment.get('vad_is_speech', True):
+                        self.logger.info(f"⏭️ Сегмент {i + 1}: пропускаем (нет речи по VAD)")
+                        translated_segments.append({
+                            **segment,
+                            'original_text': '',
+                            'translated_text': '',
+                            'translated_audio_path': None,
+                            'processing_time': time.time() - segment_start_time,
+                            'status': 'no_speech_vad'
+                        })
+                        continue
 
                     # 3a. Распознавание речи (или использование уже распознанного из Whisper)
                     if segment.get('source') == 'whisper_timestamps':
@@ -1214,20 +1309,36 @@ class VideoTranslator:
 
             # 5. Создание финального видео с выбором метода синхронизации
             use_adaptive_timing = getattr(self.config, 'USE_ADAPTIVE_VIDEO_TIMING', True)
-            use_block_sync = getattr(self.config, 'USE_BLOCK_SYNCHRONIZATION', True)
+            # ВРЕМЕННО ОТКЛЮЧАЕМ блочную синхронизацию для использования VAD фильтрации
+            use_block_sync = False  # getattr(self.config, 'USE_BLOCK_SYNCHRONIZATION', True)
             
-            if use_block_sync:
-                # Новый блочный подход с точной синхронизацией
-                success = self._create_block_synchronized_video(video_path, translated_segments, output_path)
-            elif use_adaptive_timing:
-                success = self._create_adaptive_final_video(video_path, translated_segments, output_path)
+            # Определяем нужно ли создавать видео или только субтитры
+            create_video_with_audio = output_format in ['TRANSLATION_ONLY', 'TRANSLATION_WITH_SUBTITLES']
+            
+            if create_video_with_audio:
+                # Создаем видео с переведенным аудио
+                if use_block_sync:
+                    # Новый блочный подход с точной синхронизацией
+                    success = self._create_block_synchronized_video(video_path, translated_segments, output_path)
+                elif use_adaptive_timing:
+                    success = self._create_adaptive_final_video(video_path, translated_segments, output_path)
+                else:
+                    # Используем замедление видео по умолчанию для лучшей синхронизации
+                    adjust_speed = getattr(self.config, 'ADJUST_VIDEO_SPEED', True)
+                    success = self.video_processor.create_final_video(
+                        video_path, translated_segments, output_path, 
+                        adjust_video_speed=adjust_speed
+                    )
             else:
-                # Используем замедление видео по умолчанию для лучшей синхронизации
-                adjust_speed = getattr(self.config, 'ADJUST_VIDEO_SPEED', True)
-                success = self.video_processor.create_final_video(
-                    video_path, translated_segments, output_path, 
-                    adjust_video_speed=adjust_speed
-                )
+                # Для SUBTITLES_ONLY - копируем оригинальное видео без изменений
+                import shutil
+                shutil.copy2(video_path, output_path)
+                success = True
+                self.logger.info(f"📹 Скопировано оригинальное видео для субтитров")
+            
+            # После создания видео, встраиваем субтитры если нужно
+            if success and output_format in ['SUBTITLES_ONLY', 'TRANSLATION_WITH_SUBTITLES']:
+                success = self._embed_subtitles_in_video(output_path, saved_files)
 
             if progress_callback:
                 progress_callback("Завершено" if success else "Ошибка создания видео", 100 if success else 0)
@@ -1618,6 +1729,119 @@ class VideoTranslator:
 
         return report
 
+    def _embed_subtitles_in_video(self, video_path: str, saved_files: List[Tuple[str, str]]) -> bool:
+        """
+        Встраивает субтитры в видео с помощью FFmpeg
+        
+        Args:
+            video_path: путь к видео файлу
+            saved_files: список сохраненных файлов (тип, путь)
+            
+        Returns:
+            bool: успех встраивания
+        """
+        try:
+            self.logger.info("🎬 Встраивание субтитров в видео...")
+            
+            # Находим файлы с субтитрами
+            subtitle_files = {}
+            for file_type, file_path in saved_files:
+                if 'subtitles' in file_type.lower():
+                    # Если тип просто 'subtitles', ищем все созданные .srt файлы
+                    if file_type.lower() == 'subtitles':
+                        # Ищем все созданные SRT файлы по паттерну
+                        srt_path = Path(file_path)
+                        output_dir = srt_path.parent
+                        base_name = srt_path.stem.split('_subtitles_')[0] if '_subtitles_' in srt_path.stem else srt_path.stem
+                        
+                        # Ищем файлы по паттерну
+                        for srt_type in ['original', 'translated', 'dual']:
+                            for srt_file in output_dir.glob(f"{base_name}*subtitles_{srt_type}*.srt"):
+                                subtitle_files[srt_type] = str(srt_file)
+                    else:
+                        # Новая логика с типами subtitles_original, subtitles_translated, etc
+                        if 'original' in file_type.lower():
+                            subtitle_files['original'] = file_path
+                        elif 'translated' in file_type.lower():
+                            subtitle_files['translated'] = file_path
+                        elif 'dual' in file_type.lower():
+                            subtitle_files['dual'] = file_path
+            
+            if not subtitle_files:
+                self.logger.warning("❌ Не найдены файлы субтитров для встраивания")
+                return True  # Не критическая ошибка
+            
+            # Создаем временное видео с субтитрами
+            temp_video_path = video_path.replace('.mp4', '_with_subtitles_temp.mp4')
+            
+            # Используем переведенные субтитры по приоритету
+            subtitle_to_embed = None
+            for priority in ['translated', 'dual', 'original']:
+                if priority in subtitle_files:
+                    subtitle_to_embed = subtitle_files[priority]
+                    break
+            
+            if not subtitle_to_embed:
+                self.logger.warning("❌ Не найдены подходящие субтитры для встраивания")
+                return True
+                
+            self.logger.info(f"📝 Встраиваем субтитры: {Path(subtitle_to_embed).name}")
+            
+            # FFmpeg команда для встраивания субтитров
+            import subprocess
+            cmd = [
+                'ffmpeg', '-y',
+                '-i', video_path,          # Исходное видео
+                '-i', subtitle_to_embed,   # Файл субтитров
+                '-c:v', 'copy',            # Копируем видео без перекодирования
+                '-c:a', 'copy',            # Копируем аудио без перекодирования
+                '-c:s', 'mov_text',        # Кодек субтитров для MP4
+                '-metadata:s:s:0', 'language=rus',  # Язык субтитров
+                '-metadata:s:s:0', 'title=Russian', # Название дорожки субтитров
+                temp_video_path
+            ]
+            
+            self.logger.info("🔧 Запуск FFmpeg для встраивания субтитров...")
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            
+            if result.returncode == 0:
+                # Заменяем оригинальное видео на видео с субтитрами
+                import shutil
+                shutil.move(temp_video_path, video_path)
+                self.logger.info("✅ Субтитры успешно встроены в видео")
+                
+                # Проверяем результат
+                try:
+                    import moviepy.editor as mp
+                    with mp.VideoFileClip(video_path) as test_video:
+                        self.logger.info(f"  📊 Финальное видео: {test_video.duration:.2f}s")
+                        if hasattr(test_video, 'audio') and test_video.audio:
+                            self.logger.info(f"  🔊 Содержит аудио: Да")
+                        else:
+                            self.logger.info(f"  🔊 Содержит аудио: Нет")
+                except Exception as e:
+                    self.logger.warning(f"Ошибка проверки финального видео: {e}")
+                
+                return True
+            else:
+                self.logger.error(f"❌ Ошибка встраивания субтитров:")
+                self.logger.error(f"  FFmpeg stderr: {result.stderr}")
+                
+                # Удаляем временный файл если он создался
+                if Path(temp_video_path).exists():
+                    Path(temp_video_path).unlink()
+                
+                return True  # Не критическая ошибка - видео все равно есть
+                
+        except Exception as e:
+            self.logger.error(f"❌ Критическая ошибка встраивания субтитров: {e}")
+            # Очистка временного файла
+            temp_video_path = video_path.replace('.mp4', '_with_subtitles_temp.mp4')
+            if Path(temp_video_path).exists():
+                Path(temp_video_path).unlink()
+            
+            return True  # Не критическая ошибка
+
 
 # Функции для обратной совместимости с существующим кодом
 def extract_audio(video_path: str) -> Optional[str]:
@@ -1636,6 +1860,7 @@ def transcribe_segment(segment_path: str, language: str = 'en-US') -> str:
     """Обратная совместимость: распознавание речи"""
     translator = VideoTranslator()
     return translator.speech_recognizer.transcribe_audio(segment_path, language)
+
 
 
 def synthesize_speech(text: str, lang: str = 'ru', slow: bool = False) -> Optional[str]:

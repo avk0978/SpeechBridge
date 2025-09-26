@@ -35,7 +35,8 @@ class TranslationTask:
         self.end_time: Optional[float] = None
         self.file_info: Dict = {}
         # Новые параметры пользователя
-        self.speech_engine: str = 'auto'
+        self.speech_engine: str = 'whisper'  # Всегда Whisper
+        self.whisper_model: str = 'base'     # Модель Whisper
         self.output_format: str = 'TRANSLATION_ONLY'
 
     def to_dict(self) -> Dict:
@@ -116,10 +117,13 @@ class VideoTranslatorApp:
                     return jsonify({'error': 'Файл не выбран'}), 400
 
                 # Получение настроек пользователя
-                speech_engine = request.form.get('speech_engine', 'auto')
+                whisper_model = request.form.get('speech_engine', 'base')  # Теперь это модель Whisper
                 output_format = request.form.get('output_format', 'TRANSLATION_ONLY')
                 
-                self.app.logger.info(f"📋 Настройки пользователя: engine={speech_engine}, format={output_format}")
+                # Всегда используем Whisper
+                speech_engine = 'whisper'
+                
+                self.app.logger.info(f"📋 Настройки пользователя: whisper_model={whisper_model}, format={output_format}")
 
                 # Валидация имени файла
                 if not self.config.is_allowed_file(file.filename):
@@ -163,6 +167,7 @@ class VideoTranslatorApp:
                 task = TranslationTask(task_id, str(input_path), original_filename)
                 task.file_info = validation['info']
                 task.speech_engine = speech_engine
+                task.whisper_model = whisper_model  # Устанавливаем модель Whisper
                 task.output_format = output_format
                 self.active_tasks[task_id] = task
 
@@ -220,6 +225,77 @@ class VideoTranslatorApp:
                 download_name=download_name,
                 mimetype='video/mp4'
             )
+
+        @self.app.route('/api/transcript/<task_id>')
+        def download_transcript(task_id):
+            """Загрузка стенограммы в виде текстового файла"""
+            if task_id not in self.active_tasks:
+                return jsonify({'error': 'Задача не найдена'}), 404
+
+            task = self.active_tasks[task_id]
+            if task.status != 'completed':
+                return jsonify({'error': 'Обработка не завершена'}), 400
+
+            # Ищем файлы переводов в outputs (относительно корня проекта)
+            outputs_dir = Path('../outputs')
+            
+            # Используем оригинальное имя файла для поиска
+            original_name = Path(task.original_filename).stem if task.original_filename else task_id
+            
+            # Ищем файл с переводом - сначала complete, потом translation
+            translation_file = None
+            patterns = [f"{task_id}*complete*.txt", f"{task_id}*translation*.txt"]
+            
+            for pattern in patterns:
+                matches = list(outputs_dir.glob(pattern))
+                if matches:
+                    # Берем самый новый файл
+                    translation_file = max(matches, key=lambda x: x.stat().st_mtime)
+                    self.app.logger.info(f"📄 Найден файл стенограммы: {translation_file.name}")
+                    break
+            
+            if not translation_file:
+                # Отладочная информация
+                all_files = list(outputs_dir.glob(f"{task_id}*"))
+                self.app.logger.error(f"❌ Файл стенограммы не найден для task_id: {task_id}")
+                self.app.logger.error(f"📁 Искали в: {outputs_dir}")
+                self.app.logger.error(f"🔍 Паттерны: {patterns}")
+                self.app.logger.error(f"📄 Все файлы с task_id: {[f.name for f in all_files]}")
+                return jsonify({
+                    'error': 'Файл стенограммы не найден', 
+                    'debug_info': {
+                        'task_id': task_id,
+                        'search_patterns': patterns,
+                        'all_files': [f.name for f in all_files]
+                    }
+                }), 404
+
+            # Читаем содержимое файла и создаем простую стенограмму
+            try:
+                with open(translation_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                
+                # Создаем временный файл для стенограммы
+                import tempfile
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as temp_file:
+                    temp_file.write(f"СТЕНОГРАММА ВИДЕО: {task.original_filename}\n")
+                    temp_file.write("="*50 + "\n\n")
+                    temp_file.write(content)
+                    temp_file.write(f"\n\n{'='*50}\n")
+                    temp_file.write(f"Создано: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    temp_file.write("Переведено с помощью Video-Translator\n")
+                    temp_path = temp_file.name
+
+                return send_file(
+                    temp_path,
+                    as_attachment=True,
+                    download_name=f'{original_name}_transcript.txt',
+                    mimetype='text/plain'
+                )
+                
+            except Exception as e:
+                self.app.logger.error(f"Ошибка создания стенограммы: {e}")
+                return jsonify({'error': 'Ошибка создания стенограммы'}), 500
 
         @self.app.route('/api/tasks')
         def list_tasks():
@@ -393,11 +469,11 @@ class VideoTranslatorApp:
         
         def timeout_monitor():
             """Мониторинг таймаута в отдельном потоке"""
-            if not processing_complete.wait(timeout=600):  # 10 минут
+            if not processing_complete.wait(timeout=3600):  # 60 минут (1 час)
                 timeout_occurred.set()
-                self.app.logger.error(f"⏰ Таймаут задачи {task.task_id} (10 минут)")
+                self.app.logger.error(f"⏰ Таймаут задачи {task.task_id} (60 минут)")
                 task.status = 'error'
-                task.error_message = "Обработка видео превысила лимит времени (10 минут)"
+                task.error_message = "Обработка видео превысила лимит времени (60 минут)"
         
         # Запускаем мониторинг таймаута
         timeout_thread = threading.Thread(target=timeout_monitor, daemon=True)
@@ -430,6 +506,7 @@ class VideoTranslatorApp:
                 output_path=str(output_path),
                 progress_callback=update_progress,
                 speech_engine=task.speech_engine,
+                whisper_model=task.whisper_model,
                 output_format=task.output_format
             )
             

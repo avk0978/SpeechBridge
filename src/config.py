@@ -48,9 +48,10 @@ class Config:
     AUDIO_FORMAT = 'wav'
     
     # === ПАРАМЕТРЫ СЕГМЕНТАЦИИ ===
-    MIN_SILENCE_LEN = 1000  # миллисекунды
+    MIN_SILENCE_LEN = 500   # миллисекунды (уменьшено с 1000)
     SILENCE_THRESH = -40    # дБ
-    KEEP_SILENCE = 500      # миллисекунды
+    KEEP_SILENCE = 300      # миллисекунды (уменьшено с 500)
+    MAX_SEGMENT_DURATION = 30  # максимальная длительность сегмента в секундах
     
     # === НАСТРОЙКИ КАЧЕСТВА ===
     VIDEO_CODEC = 'libx264'
@@ -62,9 +63,14 @@ class Config:
     LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     
     # === API НАСТРОЙКИ ===
-    # Speech Recognition
-    SPEECH_API_KEY = os.getenv('GOOGLE_SPEECH_API_KEY')
+    # Speech Recognition - используем только Whisper
+    SPEECH_ENGINE = 'whisper'  # Принудительно только Whisper
+    WHISPER_MODEL = os.getenv('WHISPER_MODEL', 'base')  # Модель Whisper по умолчанию
+    WHISPER_MODELS_AVAILABLE = ['tiny', 'base', 'small', 'medium', 'large', 'large-v2', 'large-v3']
     SPEECH_LANGUAGE = 'en-US'
+    
+    # Legacy настройки (не используются)
+    SPEECH_API_KEY = os.getenv('GOOGLE_SPEECH_API_KEY')
     
     # Translation  
     TRANSLATE_API_KEY = os.getenv('GOOGLE_TRANSLATE_API_KEY')
@@ -80,10 +86,11 @@ class Config:
     TTS_ENGINE_PRIORITY = ['pyttsx3']  # только pyttsx3
 
     # === ЭКСПЕРИМЕНТАЛЬНЫЕ ФУНКЦИИ ===
-    USE_SPEAKER_DIARIZATION = True   # Сегментация по спикерам
+    USE_SPEAKER_DIARIZATION = False  # Сегментация по спикерам (отключено для лучшей сегментации)
     USE_ADAPTIVE_VIDEO_TIMING = False  # Адаптивная синхронизация видео - ОТКЛЮЧЕНО ДЛЯ ТЕСТА
     USE_BLOCK_SYNCHRONIZATION = True  # Блочная синхронизация видео (новый подход)
-    ADJUST_VIDEO_SPEED = True  # Замедление видео по сегментам для синхронизации
+    ADJUST_VIDEO_SPEED = True  # Замедление видео по сегментов для синхронизации
+    USE_GENDER_DETECTION = False  # Определение пола спикеров (отключено - используем один голос)
     
     # === ДОПОЛНИТЕЛЬНЫЕ API ===
     DEEPL_API_KEY = os.getenv('DEEPL_API_KEY')

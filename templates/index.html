@@ -383,12 +383,15 @@
                     <h3 class="settings-title">⚙️ Настройки обработки</h3>
                     <div class="settings-grid">
                         <div class="setting-item">
-                            <label for="speechEngine" class="setting-label">Движок распознавания речи:</label>
+                            <label for="speechEngine" class="setting-label">Модель Whisper:</label>
                             <select id="speechEngine" class="setting-select">
-                                <option value="auto" selected>🤖 Автоматический выбор (рекомендуется)</option>
-                                <option value="sphinx">🔧 Sphinx (надежный, офлайн)</option>
-                                <option value="whisper">🎤 Whisper (высокое качество)</option>
-                                <option value="google">🌐 Google Speech API (требует настройки)</option>
+                                <option value="tiny">🚀 Tiny (быстрая, низкое качество)</option>
+                                <option value="base" selected>⚡ Base (сбалансированная, рекомендуется)</option>
+                                <option value="small">🎯 Small (хорошее качество)</option>
+                                <option value="medium">🎯 Medium (высокое качество)</option>
+                                <option value="large">🎯 Large (лучшее качество, медленно)</option>
+                                <option value="large-v2">🎯 Large-v2 (новейшая большая модель)</option>
+                                <option value="large-v3">🎯 Large-v3 (самая новая модель)</option>
                             </select>
                         </div>
                         <div class="setting-item">
@@ -463,9 +466,14 @@
                 <div id="downloadSection" class="download-section">
                     <div class="status-title">✅ Готово!</div>
                     <p style="margin-bottom: 20px;">Ваше видео успешно переведено</p>
-                    <a id="downloadBtn" class="download-btn" href="#" download>
-                        📥 Скачать переведенное видео
-                    </a>
+                    <div style="display: flex; gap: 15px; justify-content: center; flex-wrap: wrap;">
+                        <a id="downloadBtn" class="download-btn" href="#" download>
+                            📥 Скачать переведенное видео
+                        </a>
+                        <a id="transcriptBtn" class="download-btn" href="#" download style="background: linear-gradient(135deg, #4299e1 0%, #3182ce 100%);">
+                            📄 Скачать стенограмму
+                        </a>
+                    </div>
                 </div>
                 
                 <!-- Секция ошибок -->
@@ -506,6 +514,7 @@
         const currentProgress = document.getElementById('currentProgress');
         const errorMessage = document.getElementById('errorMessage');
         const downloadBtn = document.getElementById('downloadBtn');
+        const transcriptBtn = document.getElementById('transcriptBtn');
 
         // Обработка выбора файла
         fileInput.addEventListener('change', handleFileSelect);
@@ -570,20 +579,17 @@
             const speechEngine = document.getElementById('speechEngine').value;
             const outputFormat = document.getElementById('outputFormat').value;
             
-            // Логика выбора движка - оставляем AUTO для больших файлов
-            if (speechEngine === 'auto') {
-                if (file.size > 100 * 1024 * 1024) { // > 100MB
-                    updateEngineInfo('🤖 Автоматический режим: попробует Whisper → Google → Sphinx для большого файла');
-                } else {
-                    updateEngineInfo('🤖 Автоматический режим: выберет оптимальный движок из доступных');
-                }
-            } else if (speechEngine === 'whisper') {
-                updateEngineInfo('🎤 Используется только Whisper (высокое качество)');
-            } else if (speechEngine === 'google') {
-                updateEngineInfo('🌐 Используется только Google Speech API (требует настройки)');
-            } else if (speechEngine === 'sphinx') {
-                updateEngineInfo('🔧 Используется только Sphinx (надежный, офлайн)');
-            }
+            // Отображаем информацию о выбранной модели Whisper
+            const modelDescriptions = {
+                'tiny': '🚀 Whisper Tiny: Быстрая обработка, низкое качество (~1GB файлы)',
+                'base': '⚡ Whisper Base: Сбалансированная модель (рекомендуется)',
+                'small': '🎯 Whisper Small: Хорошее качество, умеренная скорость',
+                'medium': '🎯 Whisper Medium: Высокое качество, более медленная',
+                'large': '🎯 Whisper Large: Лучшее качество, медленная обработка',
+                'large-v2': '🎯 Whisper Large-v2: Новейшая большая модель',
+                'large-v3': '🎯 Whisper Large-v3: Самая новая и точная модель'
+            };
+            updateEngineInfo(modelDescriptions[speechEngine] || '🎤 Whisper модель: ' + speechEngine);
             
             // Создание FormData
             const formData = new FormData();
@@ -674,6 +680,7 @@
         function showSuccess(outputFile) {
             downloadSection.style.display = 'block';
             downloadBtn.href = `/api/download/${currentTaskId}`;
+            transcriptBtn.href = `/api/transcript/${currentTaskId}`;
         }
         
         function showError(message) {
@@ -710,26 +717,38 @@
         
         // Обработчики изменения настроек
         document.getElementById('speechEngine').addEventListener('change', function() {
-            const engine = this.value;
+            const model = this.value;
             const warningInfo = document.querySelector('.warning-info');
             let message = '';
             
-            switch(engine) {
-                case 'auto':
-                    message = 'Автоматический выбор оптимального движка на основе размера файла';
-                    warningInfo.style.display = 'none'; // Скрываем предупреждение для авто режима
+            switch(model) {
+                case 'tiny':
+                    message = 'Быстрая модель, подходит для больших файлов и быстрой обработки';
+                    warningInfo.style.display = 'none';
                     break;
-                case 'whisper':
-                    message = '<strong>Whisper</strong> - лучшее качество для больших видео, работает оффлайн';
-                    warningInfo.style.display = 'block'; // Показываем предупреждение для ручного выбора
+                case 'base':
+                    message = 'Сбалансированная модель, рекомендуется для большинства случаев';
+                    warningInfo.style.display = 'none';
                     break;
-                case 'google':
-                    message = '<strong>Google Speech API</strong> - быстрая обработка, требует интернет';
+                case 'small':
+                    message = 'Хорошее качество распознавания, умеренная скорость';
+                    warningInfo.style.display = 'none';
+                    break;
+                case 'medium':
+                    message = 'Высокое качество, требует больше времени обработки';
                     warningInfo.style.display = 'block';
+                    warningInfo.innerHTML = '⚠️ Модель Medium может работать медленно на слабых компьютерах';
                     break;
-                case 'sphinx':
-                    message = '<strong>Sphinx</strong> - оффлайн режим, подходит для коротких видео';
+                case 'large':
+                case 'large-v2':
+                case 'large-v3':
+                    message = 'Максимальное качество, очень медленная обработка';
                     warningInfo.style.display = 'block';
+                    warningInfo.innerHTML = '⚠️ Большие модели требуют много времени и памяти. Рекомендуется для коротких видео.';
+                    break;
+                default:
+                    message = 'Модель Whisper для высококачественного распознавания речи';
+                    warningInfo.style.display = 'none';
                     break;
             }
             
