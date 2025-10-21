@@ -38,6 +38,7 @@ venv.bak/
 *~
 
 # OS
+src/.DS_Store
 .DS_Store
 .DS_Store?
 ._*
